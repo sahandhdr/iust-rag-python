@@ -24,7 +24,7 @@ settings = get_settings()
 app = FastAPI(
     title="IUST RAG API",
     version="1.0.0",
-    description="سیستم RAG مرکز کامپیوتر دانشگاه علم و صنعت - Phase 1",
+    description="سیستم RAG مرکز کامپیوتر دانشگاه علم و صنعت - Phase 1/2",
 )
 
 app.add_middleware(
@@ -49,6 +49,21 @@ def _parse_json_list(raw: Optional[str], field_name: str) -> Optional[List[str]]
     if not isinstance(data, list):
         raise ValueError(f"{field_name} must be a JSON array")
     return [str(item).strip() for item in data if str(item).strip()]
+
+
+def _parse_overwrite(raw: Optional[str], default: bool = True) -> bool:
+    """
+    Laravel sends overwrite as form string: '1' | '0' | 'true' | 'false'.
+    Default True = Plan A (same doc_uuid replaces previous chunks).
+    """
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _can_manage_documents(user: UserContext) -> bool:
@@ -106,8 +121,16 @@ async def ingest_file_endpoint(
     permissions: Optional[str] = Form(None),
     status: str = Form("published"),
     version: int = Form(1),
+    overwrite: Optional[str] = Form("1"),
     current_user: UserContext = Depends(get_current_user),
 ):
+    """
+    Ingest file into Qdrant with ACL metadata.
+
+    Plan A:
+      - same doc_uuid + overwrite=true → delete old chunks then insert
+      - Laravel publish always sends overwrite=1
+    """
     if not _can_manage_documents(current_user):
         return ApiResponser.error_response(
             message="شما مجوز آپلود سند مرجع را ندارید.",
@@ -132,6 +155,8 @@ async def ingest_file_endpoint(
             status_code=422,
         )
 
+    overwrite_flag = _parse_overwrite(overwrite, default=True)
+    version_norm = version if isinstance(version, int) and version >= 1 else 1
     temp_file_path = _safe_temp_name(file.filename)
 
     try:
@@ -150,8 +175,8 @@ async def ingest_file_endpoint(
             departments=depts_list,
             permissions=perms_list,
             status=status_norm,
-            version=version if isinstance(version, int) and version >= 1 else 1,
-            overwrite=True,
+            version=version_norm,
+            overwrite=overwrite_flag,
         )
 
         if not result.get("success"):
@@ -171,13 +196,16 @@ async def ingest_file_endpoint(
                 "departments": result.get("departments") or depts_list,
                 "permissions": result.get("permissions") or perms_list,
                 "status": result.get("status") or status_norm,
-                "version": result.get("version") or version,
+                "version": result.get("version") or version_norm,
                 "chunks": result.get("chunks"),
+                "overwrite": overwrite_flag,
                 "status_ingest": "ingested",
             },
         )
     except Exception as exc:
-        logger.exception("Ingestion error for file %s (doc_uuid=%s)", file.filename, doc_uuid)
+        logger.exception(
+            "Ingestion error for file %s (doc_uuid=%s)", file.filename, doc_uuid
+        )
         return ApiResponser.error_response(
             message="خطا در پردازش فایل",
             errors=str(exc),
@@ -215,14 +243,26 @@ async def delete_document_endpoint(
 
         leftover = _qdrant_chunk_count(doc_uuid)
         if leftover > 0:
-            logger.error("Delete reported success but chunks remain | doc_uuid=%s leftover=%s", doc_uuid, leftover)
+            logger.error(
+                "Delete reported success but chunks remain | doc_uuid=%s leftover=%s",
+                doc_uuid,
+                leftover,
+            )
             return ApiResponser.error_response("حذف سند ناقص بود.", 500)
 
-        logger.info("Document deleted from Qdrant | doc_uuid=%s | by=%s | removed_chunks=%s",
-                    doc_uuid, current_user.username, existing)
+        logger.info(
+            "Document deleted from Qdrant | doc_uuid=%s | by=%s | removed_chunks=%s",
+            doc_uuid,
+            current_user.username,
+            existing,
+        )
         return ApiResponser.success_response(
             message=f"سند {doc_uuid} با موفقیت حذف شد.",
-            data={"doc_uuid": doc_uuid, "status": "deleted", "removed_chunks": existing},
+            data={
+                "doc_uuid": doc_uuid,
+                "status": "deleted",
+                "removed_chunks": existing,
+            },
         )
     except Exception:
         logger.exception("Delete error for doc_uuid=%s", doc_uuid)
