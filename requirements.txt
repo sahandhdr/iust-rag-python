@@ -1,0 +1,32 @@
+# --- FastAPI & Web ---
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-multipart
+httpx
+
+# --- Environment & Utils ---
+python-dotenv
+pytest
+
+# --- LangChain Ecosystem ---
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-chroma
+langgraph
+langchain-text-splitters
+
+# --- Vector Database ---
+qdrant-client
+langchain-qdrant
+
+# --- Document Processing & OCR ---
+pypdf
+docx2txt
+unstructured
+docling
+pdfplumber
+PIL
