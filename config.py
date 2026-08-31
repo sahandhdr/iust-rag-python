@@ -11,7 +11,11 @@ class LaravelSettings(BaseModel):
     base_url: str = Field(default="http://localhost:8000")
     verify_token_endpoint: str = Field(default="/api/v1/auth/verify-token")
     shared_storage_path: str = Field(default="/app/shared_storage")
-
+    # کلید مشترک Laravel ↔ Python برای ingest/delete (جلوگیری از deadlock)
+    internal_api_key: str = Field(
+        default="",
+        description="Shared secret; env: LARAVEL__INTERNAL_API_KEY",
+    )
 
 class AISettings(BaseModel):
     # LLM Settings

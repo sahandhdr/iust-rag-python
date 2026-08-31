@@ -1,19 +1,48 @@
 # dependencies.py
-from fastapi import Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from __future__ import annotations
+
+from fastapi import Depends, Header, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
 from auth_rbac import LaravelAuthenticator, UserContext
+from config import get_settings
 
-# تعریف سیستم Security توکن در FastAPI
-oauth2_scheme = HTTPBearer()
+oauth2_scheme = HTTPBearer(auto_error=False)
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> UserContext:
+def _internal_admin_context() -> UserContext:
     """
-    دریافت توکن از هدرها و تایید آن از طریق متد اختصاصی اتصال به لاراول.
-    این تابع مستقیماً به عنوان Dependency در روترها استفاده می‌شود.
+    کاربر سیستمی برای فراخوانی Laravel → Python.
+    بدون callback به verify-token (جلوگیری از deadlock روی artisan serve).
     """
-    token = credentials.credentials
+    return UserContext(
+        user_id=1,
+        username="laravel_internal",
+        roles=["admin", "developer"],
+        departments=[],
+        permissions=["all", "documents.read.all", "rbac.bypass"],
+    )
 
-    # ارسال به احراز هویت لاراول (LaravelAuthenticator) که در auth_rbac.py نوشتیم
-    # این متد در صورت خطا به طور خودکار HTTPException برمی‌گرداند و در صورت موفقیت UserContext را می‌دهد
-    return await LaravelAuthenticator.verify_token(token)
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(oauth2_scheme),
+    x_internal_key: str | None = Header(default=None, alias="X-Internal-Key"),
+) -> UserContext:
+    """
+    اولویت:
+      1) X-Internal-Key مطابق LARAVEL__INTERNAL_API_KEY → UserContext ادمین سیستمی
+      2) Authorization: Bearer → LaravelAuthenticator.verify_token
+    """
+    settings = get_settings()
+    expected = (settings.laravel.internal_api_key or "").strip()
+
+    if expected and x_internal_key and x_internal_key.strip() == expected:
+        return _internal_admin_context()
+
+    if credentials is None or not (credentials.credentials or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="توکن احراز هویت ارسال نشده است.",
+        )
+
+    return await LaravelAuthenticator.verify_token(credentials.credentials)
