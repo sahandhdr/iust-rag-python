@@ -40,6 +40,20 @@ class AISettings(BaseModel):
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
     retrieval_k: int = Field(default=6, ge=1, le=20, description="Number of chunks to retrieve")
 
+    # --- Hybrid Search (Path A: dense + sparse inside Qdrant) ---
+    hybrid_enabled: bool = Field(
+        default=True,
+        description="If true, retrieve via Qdrant dense+sparse RRF fusion",
+    )
+    hybrid_prefetch_limit: int = Field(
+        default=40,
+        ge=5,
+        le=200,
+        description="Prefetch limit per branch (dense / sparse) before RRF",
+    )
+    dense_vector_name: str = Field(default="dense")
+    sparse_vector_name: str = Field(default="sparse")
+
     @field_validator(
         "llm_provider",
         "embedding_provider",

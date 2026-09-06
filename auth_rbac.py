@@ -565,6 +565,15 @@ class QdrantSyncManager:
                 points_selector=self._doc_selector(validated_uuid),
             )
             logger.info("Deleted Qdrant chunks for doc_uuid=%s", validated_uuid)
+            try:
+                from create_database import delete_document_markdown_files
+                delete_document_markdown_files(validated_uuid)
+            except Exception as md_exc:
+                logger.warning(
+                    "Markdown cleanup failed for doc_uuid=%s: %s",
+                    validated_uuid,
+                    md_exc,
+                )
             return True
         except Exception as exc:
             logger.exception("Failed to delete Qdrant chunks for doc_uuid=%s", validated_uuid)

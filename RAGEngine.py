@@ -1,21 +1,11 @@
+# RAGEngine.py
 """
-RAGEngine — LangGraph retrieve → generate with RBAC-filtered Qdrant search.
-
-Security:
-  - UserContext reconstructed fail-closed from checkpoint dict
-  - Retrieval always goes through RBACManager.build_qdrant_filter
-    (DocumentAccessPolicy: or / and / hybrid)
-  - thread_id scoped to user_id + session_id
-
-Phase-1:
-  - retrieval_k from config
-  - msg_id must NOT filter public knowledge retrieve
-  - query()      → one-shot answer
-  - query_stream() → async generator for SSE (sources, token, done)
+RAGEngine — LangGraph retrieve → generate with Hybrid Qdrant search + RBAC.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, TypedDict
 
@@ -28,15 +18,13 @@ from qdrant_client.http import models as rest
 
 from auth_rbac import RBACManager, UserContext
 from config import get_settings
-from create_database import get_vector_store
 from get_llm import get_llm
+from hybrid_retrieval import hybrid_search
 
 logger = logging.getLogger(__name__)
 
 
 class RAGState(TypedDict):
-    """Checkpoint-safe graph state (user_context as dict, not object)."""
-
     question: str
     session_id: str
     user_context: Dict[str, Any]
@@ -68,9 +56,8 @@ BASE_RULES = (
 
 class RAGEngine:
     def __init__(self) -> None:
-        logger.info("Initializing RAG Engine (Qdrant + RBAC Policy)...")
+        logger.info("Initializing RAG Engine (Hybrid Qdrant + RBAC)...")
         self.llm = get_llm()
-        self.db = get_vector_store()
         self.rbac_manager = RBACManager()
         self.retrieval_k = get_settings().ai.retrieval_k
         self.app = self._build_graph()
@@ -119,17 +106,12 @@ class RAGEngine:
         qdrant_filter: Optional[rest.Filter],
         msg_id: str,
     ) -> rest.Filter:
-        """
-        Legacy helper — DO NOT use for public knowledge ask.
-        Kept for possible future message-scoped file chunks only.
-        """
         msg_condition = rest.FieldCondition(
             key="metadata.msg_id",
             match=rest.MatchValue(value=msg_id),
         )
         if qdrant_filter is None:
             return rest.Filter(must=[msg_condition])
-
         must = list(qdrant_filter.must or [])
         must.append(msg_condition)
         return rest.Filter(
@@ -139,50 +121,22 @@ class RAGEngine:
             min_should=getattr(qdrant_filter, "min_should", None),
         )
 
-    def _sources_from_results(self, results: list) -> List[Dict[str, Any]]:
-        sources: List[Dict[str, Any]] = []
-        for doc, score in results:
-            sources.append(
-                {
-                    "source": doc.metadata.get("source", "Unknown"),
-                    "page": doc.metadata.get("page", 0),
-                    "chunk_index": doc.metadata.get("chunk_index"),
-                    "doc_uuid": doc.metadata.get("doc_uuid"),
-                    "roles": doc.metadata.get("roles"),
-                    "departments": doc.metadata.get("departments"),
-                    "status": doc.metadata.get("status"),
-                    "relevance_score": float(score),
-                }
-            )
-        return sources
-
     async def _retrieve_for_query(
         self,
         question: str,
         user_context: UserContext,
         session_id: str,
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """Shared retrieve for graph node and stream path. No msg_id filter."""
-        logger.info("Retrieving org context | session=%s", session_id)
+        logger.info("Hybrid retrieving org context | session=%s", session_id)
 
-        qdrant_filter = self.rbac_manager.build_qdrant_filter(user_context)
+        def _run():
+            return hybrid_search(
+                question,
+                user_context,
+                k=self.retrieval_k,
+            )
 
-        logger.debug(
-            "Qdrant filter applied | user_id=%s | roles=%s | depts=%s | filter=%s",
-            user_context.user_id,
-            sorted(user_context.roles),
-            sorted(user_context.departments),
-            qdrant_filter,
-        )
-
-        results = await self.db.asimilarity_search_with_score(
-            question,
-            k=self.retrieval_k,
-            filter=qdrant_filter,
-        )
-
-        org_context = "\n\n".join(doc.page_content for doc, _ in results)
-        sources = self._sources_from_results(results)
+        org_context, sources = await asyncio.to_thread(_run)
         return org_context, sources
 
     def _build_system_prompt(
@@ -226,14 +180,7 @@ class RAGEngine:
         question = state["question"]
         org_context = state.get("org_context", "")
 
-        system_prompt = self._build_system_prompt(org_context, user_file)
-
         if user_file:
-            prompt = ChatPromptTemplate.from_messages(
-                [("system", system_prompt), ("human", "{question}")]
-            )
-            # system already has contexts embedded; template vars only question
-            # Re-build with placeholders for chain invoke compatibility:
             system_with_vars = (
                 "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
                 "دو منبع اطلاعاتی در اختیار داری:\n"
@@ -285,7 +232,6 @@ class RAGEngine:
         user_file_content: Optional[str] = None,
         msg_id: Optional[str] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """One-shot RAG (non-streaming). msg_id ignored for retrieve."""
         user_context_dict = self._user_context_to_dict(user_context)
         thread_id = self._build_thread_id(user_context, session_id)
         config = {"configurable": {"thread_id": thread_id}}
@@ -311,14 +257,6 @@ class RAGEngine:
         user_context: UserContext,
         user_file_content: Optional[str] = None,
     ) -> AsyncIterator[Tuple[str, Any]]:
-        """
-        Streaming RAG for SSE.
-
-        Yields:
-          ("sources", list[dict])
-          ("token", str)          — may yield many times
-          ("done", {"answer": str})
-        """
         org_context, sources = await self._retrieve_for_query(
             question=question,
             user_context=user_context,
@@ -338,7 +276,6 @@ class RAGEngine:
             if text is None:
                 continue
             if isinstance(text, list):
-                # some providers return content blocks
                 text = "".join(
                     block.get("text", "") if isinstance(block, dict) else str(block)
                     for block in text

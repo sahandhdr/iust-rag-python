@@ -15,29 +15,35 @@ Metadata contract (every chunk payload):
 
 Fail-closed: empty text / invalid tags → raise, never silent partial write.
 """
+# create_database.py
+"""
+Vector store layer — chunking + Qdrant persistence with Hybrid (dense + sparse).
+
+Point layout:
+  vectors:  { dense: [...], sparse: SparseVector }
+  payload:  { page_content, metadata: { doc_uuid, roles, ... } }
+
+Collection is created from code only (no manual Qdrant UI steps).
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
-from langchain_core.documents import Document
-from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest_models
 
 from config import get_settings
 from get_embedding_function import get_embedding_function
+from sparse_encoder import get_sparse_encoder
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Tag helpers
-# ---------------------------------------------------------------------------
 
 def normalize_tag(value: Optional[str]) -> str:
     if value is None:
@@ -75,10 +81,6 @@ def build_document_metadata(
     version: int = 1,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Build normalized metadata dict for a single chunk.
-    Always writes both multi-tag fields and legacy scalar `department`.
-    """
     settings = get_settings()
 
     roles_n = normalize_tag_list(roles)
@@ -97,7 +99,6 @@ def build_document_metadata(
     if not isinstance(version, int) or version < 1:
         raise ValueError("version must be a positive integer")
 
-    # legacy scalar: first department, else "public" if public role, else first role
     if depts_n:
         legacy_department = depts_n[0]
     elif "public" in roles_n:
@@ -125,10 +126,6 @@ def build_document_metadata(
     return meta
 
 
-# ---------------------------------------------------------------------------
-# Qdrant client / collection
-# ---------------------------------------------------------------------------
-
 def get_qdrant_client() -> QdrantClient:
     settings = get_settings()
     qdrant_path = settings.db.qdrant_path
@@ -146,28 +143,60 @@ def get_qdrant_client() -> QdrantClient:
         raise
 
 
+def _resolve_vector_size(embedding: Any) -> int:
+    try:
+        probe = embedding.embed_query("dimension probe")
+        if isinstance(probe, list) and probe:
+            return len(probe)
+    except Exception as exc:
+        logger.warning("Could not probe embedding dim; defaulting to 1536. err=%s", exc)
+    return 1536
+
+
 def ensure_collection_exists(
     client: QdrantClient,
     collection_name: str,
     vector_size: int = 1536,
 ) -> None:
     """
-    Idempotent collection create.
-    Default vector_size=1536 matches text-embedding-3-small;
-    override when using a different embedding model.
+    Idempotent create for Hybrid collection:
+      dense  — COSINE dense vector
+      sparse — named sparse vector
+    If collection already exists, leave it (ops must use new name or wipe).
     """
+    settings = get_settings()
+    dense_name = settings.ai.dense_vector_name
+    sparse_name = settings.ai.sparse_vector_name
+
     try:
         if client.collection_exists(collection_name=collection_name):
+            logger.info("Collection '%s' already exists — skipping create", collection_name)
             return
-        logger.info("Creating collection '%s' (dim=%s)", collection_name, vector_size)
+
+        logger.info(
+            "Creating hybrid collection '%s' (dense_dim=%s, dense=%s, sparse=%s)",
+            collection_name,
+            vector_size,
+            dense_name,
+            sparse_name,
+        )
         client.create_collection(
             collection_name=collection_name,
-            vectors_config=rest_models.VectorParams(
-                size=vector_size,
-                distance=rest_models.Distance.COSINE,
-            ),
+            vectors_config={
+                dense_name: rest_models.VectorParams(
+                    size=vector_size,
+                    distance=rest_models.Distance.COSINE,
+                ),
+            },
+            sparse_vectors_config={
+                sparse_name: rest_models.SparseVectorParams(
+                    index=rest_models.SparseIndexParams(
+                        on_disk=False,
+                    ),
+                ),
+            },
         )
-        # payload indexes for ACL filters (best-effort; ignore if unsupported)
+
         for field_name, field_schema in (
             ("metadata.roles", rest_models.PayloadSchemaType.KEYWORD),
             ("metadata.departments", rest_models.PayloadSchemaType.KEYWORD),
@@ -184,43 +213,49 @@ def ensure_collection_exists(
                 )
             except Exception as idx_exc:
                 logger.debug("Payload index %s skipped: %s", field_name, idx_exc)
-        logger.info("Collection '%s' ready", collection_name)
+
+        logger.info("Hybrid collection '%s' ready", collection_name)
     except Exception as exc:
         logger.error("ensure_collection_exists failed: %s", exc, exc_info=True)
         raise
 
 
-def _resolve_vector_size(embedding: Any) -> int:
-    """Best-effort detect embedding dimension."""
-    try:
-        probe = embedding.embed_query("dimension probe")
-        if isinstance(probe, list) and probe:
-            return len(probe)
-    except Exception as exc:
-        logger.warning("Could not probe embedding dim; defaulting to 1536. err=%s", exc)
-    return 1536
-
-
-def get_vector_store() -> QdrantVectorStore:
+def ensure_hybrid_collection() -> QdrantClient:
+    """Connect + ensure hybrid schema. Call from ingest/retrieve."""
     settings = get_settings()
-    collection_name = settings.db.qdrant_collection
-    embedding = get_embedding_function()
     client = get_qdrant_client()
+    embedding = get_embedding_function()
     ensure_collection_exists(
         client,
-        collection_name,
+        settings.db.qdrant_collection,
         vector_size=_resolve_vector_size(embedding),
     )
-    return QdrantVectorStore(
-        client=client,
-        collection_name=collection_name,
-        embedding=embedding,
-    )
+    return client
 
 
-# ---------------------------------------------------------------------------
-# Core ingest into Qdrant
-# ---------------------------------------------------------------------------
+def delete_document_markdown_files(doc_uuid: str) -> int:
+    """Remove derivative markdown files data/**/{doc_uuid}.md. Returns count deleted."""
+    settings = get_settings()
+    data_dir = settings.ingestion.data_dir
+    if not doc_uuid or not str(doc_uuid).strip():
+        return 0
+    safe = re.sub(r"[^a-zA-Z0-9\-_]", "_", str(doc_uuid).strip())
+    target_names = {f"{safe}.md"}
+    removed = 0
+    if not os.path.isdir(data_dir):
+        return 0
+    for root, _dirs, files in os.walk(data_dir):
+        for name in files:
+            if name in target_names:
+                path = os.path.join(root, name)
+                try:
+                    os.remove(path)
+                    removed += 1
+                    logger.info("Removed derivative markdown: %s", path)
+                except OSError as exc:
+                    logger.warning("Failed to remove %s: %s", path, exc)
+    return removed
+
 
 def process_single_document(
     md_path: str,
@@ -232,15 +267,14 @@ def process_single_document(
     status: Optional[str] = None,
     version: int = 1,
     overwrite: bool = True,
-    # backward-compatible single department argument
     department: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Chunk markdown file and upsert into Qdrant with full ACL metadata.
-
-    If `department` is passed (legacy), it is merged into `departments`.
+    Chunk markdown and upsert into Qdrant with dense + sparse vectors.
     """
     settings = get_settings()
+    dense_name = settings.ai.dense_vector_name
+    sparse_name = settings.ai.sparse_vector_name
 
     if not doc_uuid or not str(doc_uuid).strip():
         doc_uuid = str(uuid.uuid4())
@@ -249,7 +283,6 @@ def process_single_document(
         doc_uuid = str(doc_uuid).strip()
         logger.info("Using provided doc_uuid=%s", doc_uuid)
 
-    # merge legacy department into departments list
     dept_list = list(departments or [])
     if department:
         dept_list.append(department)
@@ -272,8 +305,29 @@ def process_single_document(
     if not chunks:
         raise ValueError(f"Splitter produced zero chunks for {md_path}")
 
+    if overwrite:
+        try:
+            delete_document_from_qdrant(doc_uuid, delete_markdown=False)
+            logger.info("Overwrite: deleted previous Qdrant points for doc_uuid=%s", doc_uuid)
+        except Exception as del_exc:
+            logger.warning(
+                "Overwrite delete skipped/failed for doc_uuid=%s: %s",
+                doc_uuid,
+                del_exc,
+            )
+
+    client = ensure_hybrid_collection()
+    embedding = get_embedding_function()
+    sparse_encoder = get_sparse_encoder()
     source_name = os.path.basename(md_path)
-    documents: List[Document] = []
+
+    dense_vectors = embedding.embed_documents(list(chunks))
+    if len(dense_vectors) != len(chunks):
+        raise RuntimeError("embed_documents size mismatch")
+
+    points: List[rest_models.PointStruct] = []
+    first_meta: Dict[str, Any] = {}
+
     for index, chunk in enumerate(chunks):
         meta = build_document_metadata(
             doc_uuid=doc_uuid,
@@ -286,29 +340,33 @@ def process_single_document(
             status=status,
             version=version,
         )
-        documents.append(Document(page_content=chunk, metadata=meta))
+        if index == 0:
+            first_meta = meta
 
-    if overwrite:
-        from auth_rbac import get_qdrant_sync_manager
-
-        sync_manager = get_qdrant_sync_manager()
-        try:
-            sync_manager.delete_document_by_uuid(doc_uuid)
-            logger.info("Overwrite: deleted previous chunks for doc_uuid=%s", doc_uuid)
-        except Exception as del_exc:
-            # first-time insert: delete may fail if nothing exists — log and continue
-            logger.warning(
-                "Overwrite delete skipped/failed for doc_uuid=%s: %s",
-                doc_uuid,
-                del_exc,
+        point_id = str(uuid.uuid4())
+        sparse_vec = sparse_encoder.encode(chunk)
+        points.append(
+            rest_models.PointStruct(
+                id=point_id,
+                vector={
+                    dense_name: dense_vectors[index],
+                    sparse_name: sparse_vec,
+                },
+                payload={
+                    "page_content": chunk,
+                    "metadata": meta,
+                },
             )
+        )
 
-    vector_store = get_vector_store()
-    vector_store.add_documents(documents)
+    client.upsert(
+        collection_name=settings.db.qdrant_collection,
+        points=points,
+        wait=True,
+    )
 
-    first_meta = documents[0].metadata
     logger.info(
-        "Ingested %s chunks | doc_uuid=%s | roles=%s | departments=%s | status=%s | file=%s",
+        "Hybrid ingested %s chunks | doc_uuid=%s | roles=%s | departments=%s | status=%s | file=%s",
         len(chunks),
         doc_uuid,
         first_meta.get("roles"),
@@ -326,17 +384,47 @@ def process_single_document(
         "status": first_meta.get("status"),
         "version": first_meta.get("version"),
         "file": source_name,
+        "hybrid": True,
     }
 
 
-def delete_document_from_qdrant(doc_uuid: str) -> bool:
-    try:
-        from auth_rbac import get_qdrant_sync_manager
-
-        return get_qdrant_sync_manager().delete_document_by_uuid(doc_uuid)
-    except Exception as exc:
-        logger.error("delete_document_from_qdrant failed doc_uuid=%s: %s", doc_uuid, exc)
+def delete_document_from_qdrant(doc_uuid: str, delete_markdown: bool = True) -> bool:
+    """Delete all points for doc_uuid; optionally remove derivative .md files."""
+    if not doc_uuid or not str(doc_uuid).strip():
         return False
+    validated = str(doc_uuid).strip()
+    settings = get_settings()
+    client = get_qdrant_client()
+
+    try:
+        if client.collection_exists(collection_name=settings.db.qdrant_collection):
+            client.delete(
+                collection_name=settings.db.qdrant_collection,
+                points_selector=rest_models.FilterSelector(
+                    filter=rest_models.Filter(
+                        must=[
+                            rest_models.FieldCondition(
+                                key="metadata.doc_uuid",
+                                match=rest_models.MatchValue(value=validated),
+                            )
+                        ]
+                    )
+                ),
+            )
+            logger.info("Deleted Qdrant hybrid points for doc_uuid=%s", validated)
+        else:
+            logger.warning(
+                "Collection %s missing on delete doc_uuid=%s",
+                settings.db.qdrant_collection,
+                validated,
+            )
+    except Exception as exc:
+        logger.error("delete_document_from_qdrant failed doc_uuid=%s: %s", validated, exc)
+        return False
+
+    if delete_markdown:
+        delete_document_markdown_files(validated)
+    return True
 
 
 def update_document_metadata_in_qdrant(
@@ -356,14 +444,25 @@ def update_document_metadata_in_qdrant(
         return False
 
 
+# Backward-compatible alias used by older imports
+def get_vector_store():
+    """
+    Legacy helper. Hybrid retrieve must use hybrid_retrieval, not this store.
+    Ensures collection exists and returns raw client for callers that only need connectivity.
+    """
+    return ensure_hybrid_collection()
+
+
 __all__ = [
     "normalize_tag",
     "normalize_tag_list",
     "build_document_metadata",
     "get_qdrant_client",
     "ensure_collection_exists",
+    "ensure_hybrid_collection",
     "get_vector_store",
     "process_single_document",
     "delete_document_from_qdrant",
+    "delete_document_markdown_files",
     "update_document_metadata_in_qdrant",
 ]
