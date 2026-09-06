@@ -1,30 +1,31 @@
+# """
+# Vector store layer — chunking + Qdrant persistence.
+#
+# Metadata contract (every chunk payload):
+#   doc_uuid      str          required
+#   roles         list[str]    required (may be empty only for admin-only docs)
+#   departments   list[str]    required (may be empty)
+#   permissions   list[str]    optional
+#   status        str          required (default: published)
+#   version       int          required (default: 1)
+#   department    str          legacy scalar (first department or "public")
+#   source        str
+#   chunk_index   int
+#   total_chunks  int
+#
+# Fail-closed: empty text / invalid tags → raise, never silent partial write.
+# """
 """
-Vector store layer — chunking + Qdrant persistence.
-
-Metadata contract (every chunk payload):
-  doc_uuid      str          required
-  roles         list[str]    required (may be empty only for admin-only docs)
-  departments   list[str]    required (may be empty)
-  permissions   list[str]    optional
-  status        str          required (default: published)
-  version       int          required (default: 1)
-  department    str          legacy scalar (first department or "public")
-  source        str
-  chunk_index   int
-  total_chunks  int
-
-Fail-closed: empty text / invalid tags → raise, never silent partial write.
-"""
+# Vector store layer — chunking + Qdrant persistence with Hybrid (dense + sparse).
+#
+# Point layout:
+#   vectors:  { dense: [...], sparse: SparseVector }
+#   payload:  { page_content, metadata: { doc_uuid, roles, ... } }
+#
+# Collection is created from code only (no manual Qdrant UI steps).
+# """
 # create_database.py
-"""
-Vector store layer — chunking + Qdrant persistence with Hybrid (dense + sparse).
 
-Point layout:
-  vectors:  { dense: [...], sparse: SparseVector }
-  payload:  { page_content, metadata: { doc_uuid, roles, ... } }
-
-Collection is created from code only (no manual Qdrant UI steps).
-"""
 
 from __future__ import annotations
 
