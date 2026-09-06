@@ -38,7 +38,7 @@ class AISettings(BaseModel):
 
     # Generation & Retrieval
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
-    retrieval_k: int = Field(default=6, ge=1, le=20, description="Number of chunks to retrieve")
+    retrieval_k: int = Field(default=6, ge=1, le=50, description="Number of chunks to retrieve")
 
     # --- Hybrid Search (Path A: dense + sparse inside Qdrant) ---
     hybrid_enabled: bool = Field(
