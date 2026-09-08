@@ -1,6 +1,10 @@
 # RAGEngine.py
 """
 RAGEngine — LangGraph retrieve → generate with Hybrid Qdrant search + RBAC.
+
+Production rule:
+  If retrieval returns no sources and the user did not upload a file,
+  do NOT call the LLM. Return a fixed «no knowledge» message.
 """
 
 from __future__ import annotations
@@ -23,6 +27,11 @@ from hybrid_retrieval import hybrid_search
 
 logger = logging.getLogger(__name__)
 
+EMPTY_KNOWLEDGE_ANSWER = (
+    "در پایگاه دانش و اسناد منتشرشدهٔ مرکز کامپیوتر دانشگاه علم و صنعت ایران، "
+    "اطلاعاتی در این مورد پیدا نشد. لطفاً سؤال را دقیق‌تر بپرسید یا با پشتیبانی مرکز تماس بگیرید."
+)
+
 
 class RAGState(TypedDict):
     question: str
@@ -36,21 +45,22 @@ class RAGState(TypedDict):
 
 
 BASE_RULES = (
-    "قوانین مهم:\n"
-    "- فقط بر اساس اطلاعات موجود در context پاسخ بده. هیچ واقعیتی را از خودت نساز.\n"
-    "- اگر اطلاعات کافی نیست، صریح بگو که در اسناد موجود پاسخی پیدا نکردی.\n"
-    "- اگر در context اطلاعات متناقض یا متفاوت وجود دارد (مثلاً ساعات کاری متفاوت):\n"
-    "  • حتماً هر دو نسخه را ذکر کن.\n"
-    "  • منبع مربوط به هر نسخه را تا حد امکان مشخص کن.\n"
-    "  • بگو که هر دو می‌توانند معتبر باشند یا نیاز به بررسی بیشتر دارند.\n"
-    "- اگر سؤال دربارهٔ افراد، سمت‌ها، مدیران یا ساختار سازمانی است و در context نام افراد آمده:\n"
-    "  • همهٔ نام‌ها و سمت‌های مرتبط موجود در context را ذکر کن.\n"
-    "  • هیچ نامی را به بهانهٔ خلاصه‌نویسی حذف نکن.\n"
-    "  • اگر ریاست/معاونت/کارشناس در context هست، همگی باید در پاسخ باشند.\n"
-    "- پاسخ را به زبان دوستانه، روان و حرفه‌ای بنویس. می‌توانی مختصر باشی، "
-    "اما مختصر بودن هرگز به معنای حذف نام‌ها یا حقایق موجود در context نیست.\n"
+    "قوانین مهم و غیرقابل نقض:\n"
+    "- فقط و فقط بر اساس اطلاعات موجود در بخش «دانش سازمانی» و (در صورت وجود) "
+    "«محتوای فایل کاربر» پاسخ بده.\n"
+    "- هیچ ساعت کاری، نام فرد، سمت، شماره تماس، آدرس یا واقعیت دیگری را از دانش عمومی "
+    "یا حدس خودت اضافه نکن.\n"
+    "- اگر در دانش سازمانی چیزی مرتبط نیست، فقط بگو اطلاعات در اسناد موجود نیست؛ "
+    "جزئیات ساختگی ننویس.\n"
+    "- اگر در دانش سازمانی اطلاعات متناقض وجود دارد (مثلاً دو ساعت کاری مختلف):\n"
+    "  • هر دو نسخه را ذکر کن.\n"
+    "  • تا حد امکان منبع هر نسخه را مشخص کن.\n"
+    "  • بگو برای تأیید نهایی با مرکز تماس بگیرند.\n"
+    "- اگر سؤال دربارهٔ افراد یا سمت‌ها است و در context نام آمده:\n"
+    "  • همهٔ نام‌ها و سمت‌های مرتبط را ذکر کن؛ هیچ‌کدام را حذف نکن.\n"
+    "  • ریاست، معاونت و کارشناس اگر در context هستند همگی باید در پاسخ باشند.\n"
+    "- پاسخ را دوستانه، روان و حرفه‌ای بنویس؛ مختصر بودن به معنای حذف حقایق context نیست.\n"
     "- عین جملات اسناد را کپی نکن؛ مضمون را با لحن پشتیبانی دانشگاه بازنویسی کن.\n"
-    "- از لحن رسمی اما صمیمی استفاده کن (مناسب پشتیبانی دانشگاه).\n"
 )
 
 
@@ -121,6 +131,18 @@ class RAGEngine:
             min_should=getattr(qdrant_filter, "min_should", None),
         )
 
+    def _has_org_evidence(
+        self, org_context: str, sources: List[Dict[str, Any]]
+    ) -> bool:
+        if sources and len(sources) > 0:
+            return True
+        if org_context and str(org_context).strip():
+            return True
+        return False
+
+    def _has_user_file(self, user_file_content: Optional[str]) -> bool:
+        return bool(user_file_content and str(user_file_content).strip())
+
     async def _retrieve_for_query(
         self,
         question: str,
@@ -137,7 +159,7 @@ class RAGEngine:
             )
 
         org_context, sources = await asyncio.to_thread(_run)
-        return org_context, sources
+        return org_context or "", sources or []
 
     def _build_system_prompt(
         self,
@@ -151,9 +173,11 @@ class RAGEngine:
                 "۱) دانش سازمانی رسمی (اسناد مرکز)\n"
                 "۲) محتوای فایلی که کاربر آپلود کرده\n\n"
                 f"{BASE_RULES}\n"
-                "- در سؤالات مربوط به دانشگاه و مرکز کامپیوتر، اولویت با دانش سازمانی رسمی است.\n"
+                "- در سؤالات مربوط به دانشگاه و مرکز، اولویت با دانش سازمانی رسمی است.\n"
                 "- اگر فایل کاربر با اسناد رسمی تعارض دارد، اسناد رسمی را مقدم بدان و تعارض را ذکر کن.\n"
-                "- اگر سؤال مستقیماً در مورد فایل آپلود‌شده است، آن را با دقت تحلیل کن.\n\n"
+                "- اگر سؤال مستقیماً دربارهٔ فایل آپلود‌شده است، آن را با دقت تحلیل کن.\n"
+                "- اگر دانش سازمانی خالی است و فقط فایل کاربر موجود است، فقط بر اساس فایل پاسخ بده "
+                "و ادعا نکن که از اسناد رسمی مرکز آمده است.\n\n"
                 f"دانش سازمانی:\n{org_context}\n\n"
                 f"محتوای فایل کاربر:\n{user_file_content}"
             )
@@ -178,18 +202,31 @@ class RAGEngine:
 
         user_file = state.get("user_file_content")
         question = state["question"]
-        org_context = state.get("org_context", "")
+        org_context = state.get("org_context", "") or ""
+        sources = state.get("sources") or []
 
-        if user_file:
+        # Production guard: no org evidence and no user file → fixed message, no LLM.
+        if not self._has_org_evidence(org_context, sources) and not self._has_user_file(
+            user_file
+        ):
+            logger.warning(
+                "Empty retrieval and no user file | session=%s | skipping LLM",
+                state["session_id"],
+            )
+            return {"answer": EMPTY_KNOWLEDGE_ANSWER}
+
+        if self._has_user_file(user_file):
             system_with_vars = (
                 "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
                 "دو منبع اطلاعاتی در اختیار داری:\n"
                 "۱) دانش سازمانی رسمی (اسناد مرکز)\n"
                 "۲) محتوای فایلی که کاربر آپلود کرده\n\n"
                 f"{BASE_RULES}\n"
-                "- در سؤالات مربوط به دانشگاه و مرکز کامپیوتر، اولویت با دانش سازمانی رسمی است.\n"
+                "- در سؤالات مربوط به دانشگاه و مرکز، اولویت با دانش سازمانی رسمی است.\n"
                 "- اگر فایل کاربر با اسناد رسمی تعارض دارد، اسناد رسمی را مقدم بدان و تعارض را ذکر کن.\n"
-                "- اگر سؤال مستقیماً در مورد فایل آپلود‌شده است، آن را با دقت تحلیل کن.\n\n"
+                "- اگر سؤال مستقیماً دربارهٔ فایل آپلود‌شده است، آن را با دقت تحلیل کن.\n"
+                "- اگر دانش سازمانی خالی است و فقط فایل کاربر موجود است، فقط بر اساس فایل پاسخ بده "
+                "و ادعا نکن که از اسناد رسمی مرکز آمده است.\n\n"
                 "دانش سازمانی:\n{org_context}\n\n"
                 "محتوای فایل کاربر:\n{user_file_content}"
             )
@@ -204,24 +241,24 @@ class RAGEngine:
                     "question": question,
                 }
             )
-        else:
-            system_with_vars = (
-                "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
-                "فقط به دانش سازمانی رسمی (اسناد مرکز) دسترسی داری.\n\n"
-                f"{BASE_RULES}\n"
-                "دانش سازمانی:\n{org_context}"
-            )
-            prompt = ChatPromptTemplate.from_messages(
-                [("system", system_with_vars), ("human", "{question}")]
-            )
-            chain = prompt | self.llm | StrOutputParser()
-            answer = await chain.ainvoke(
-                {
-                    "org_context": org_context,
-                    "question": question,
-                }
-            )
+            return {"answer": answer}
 
+        system_with_vars = (
+            "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
+            "فقط به دانش سازمانی رسمی (اسناد مرکز) دسترسی داری.\n\n"
+            f"{BASE_RULES}\n"
+            "دانش سازمانی:\n{org_context}"
+        )
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", system_with_vars), ("human", "{question}")]
+        )
+        chain = prompt | self.llm | StrOutputParser()
+        answer = await chain.ainvoke(
+            {
+                "org_context": org_context,
+                "question": question,
+            }
+        )
         return {"answer": answer}
 
     async def query(
@@ -263,6 +300,18 @@ class RAGEngine:
             session_id=session_id,
         )
         yield ("sources", sources)
+
+        # Same production guard for SSE path.
+        if not self._has_org_evidence(org_context, sources) and not self._has_user_file(
+            user_file_content
+        ):
+            logger.warning(
+                "Empty retrieval and no user file | session=%s | stream skip LLM",
+                session_id,
+            )
+            yield ("token", EMPTY_KNOWLEDGE_ANSWER)
+            yield ("done", {"answer": EMPTY_KNOWLEDGE_ANSWER})
+            return
 
         system_text = self._build_system_prompt(org_context, user_file_content)
         messages = [
