@@ -1,3 +1,5 @@
+# create_database.py
+
 # """
 # Vector store layer — chunking + Qdrant persistence.
 #
@@ -24,8 +26,6 @@
 #
 # Collection is created from code only (no manual Qdrant UI steps).
 # """
-# create_database.py
-
 
 from __future__ import annotations
 
@@ -154,6 +154,17 @@ def _resolve_vector_size(embedding: Any) -> int:
     return 1536
 
 
+def _count_points(client: QdrantClient, collection_name: str) -> int:
+    try:
+        if not client.collection_exists(collection_name=collection_name):
+            return 0
+        info = client.get_collection(collection_name=collection_name)
+        return int(getattr(info, "points_count", None) or 0)
+    except Exception as exc:
+        logger.warning("points_count failed for %s: %s", collection_name, exc)
+        return 0
+
+
 def ensure_collection_exists(
     client: QdrantClient,
     collection_name: str,
@@ -163,7 +174,7 @@ def ensure_collection_exists(
     Idempotent create for Hybrid collection:
       dense  — COSINE dense vector
       sparse — named sparse vector
-    If collection already exists, leave it (ops must use new name or wipe).
+    If collection already exists, leave it (ops must use wipe to reset).
     """
     settings = get_settings()
     dense_name = settings.ai.dense_vector_name
@@ -234,6 +245,54 @@ def ensure_hybrid_collection() -> QdrantClient:
     return client
 
 
+def wipe_and_recreate_collection() -> Dict[str, Any]:
+    """
+    Production wipe:
+      1) count points (best-effort)
+      2) delete collection if exists
+      3) recreate Hybrid schema via ensure_collection_exists
+    Does NOT touch MySQL or Laravel disk. Does NOT purge data/ orphans (P1-29).
+    Idempotent if collection was already missing.
+    """
+    settings = get_settings()
+    collection = settings.db.qdrant_collection
+    client = get_qdrant_client()
+    embedding = get_embedding_function()
+    vector_size = _resolve_vector_size(embedding)
+
+    points_before = _count_points(client, collection)
+    existed = False
+    try:
+        existed = bool(client.collection_exists(collection_name=collection))
+    except Exception as exc:
+        logger.warning("collection_exists check failed: %s", exc)
+
+    wiped = False
+    if existed:
+        try:
+            client.delete_collection(collection_name=collection)
+            wiped = True
+            logger.info("Deleted Qdrant collection '%s' (points_before≈%s)", collection, points_before)
+        except Exception as exc:
+            logger.error("delete_collection failed: %s", exc, exc_info=True)
+            raise
+
+    ensure_collection_exists(client, collection, vector_size=vector_size)
+    points_after = _count_points(client, collection)
+
+    return {
+        "collection": collection,
+        "wiped": wiped,
+        "recreated": True,
+        "hybrid": True,
+        "points_before": points_before,
+        "points_after": points_after,
+        "dense_vector": settings.ai.dense_vector_name,
+        "sparse_vector": settings.ai.sparse_vector_name,
+        "vector_size": vector_size,
+    }
+
+
 def delete_document_markdown_files(doc_uuid: str) -> int:
     """Remove derivative markdown files data/**/{doc_uuid}.md. Returns count deleted."""
     settings = get_settings()
@@ -270,9 +329,7 @@ def process_single_document(
     overwrite: bool = True,
     department: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Chunk markdown and upsert into Qdrant with dense + sparse vectors.
-    """
+    """Chunk markdown and upsert into Qdrant with dense + sparse vectors."""
     settings = get_settings()
     dense_name = settings.ai.dense_vector_name
     sparse_name = settings.ai.sparse_vector_name
@@ -445,12 +502,8 @@ def update_document_metadata_in_qdrant(
         return False
 
 
-# Backward-compatible alias used by older imports
 def get_vector_store():
-    """
-    Legacy helper. Hybrid retrieve must use hybrid_retrieval, not this store.
-    Ensures collection exists and returns raw client for callers that only need connectivity.
-    """
+    """Legacy helper. Ensures collection exists and returns client."""
     return ensure_hybrid_collection()
 
 
@@ -461,6 +514,7 @@ __all__ = [
     "get_qdrant_client",
     "ensure_collection_exists",
     "ensure_hybrid_collection",
+    "wipe_and_recreate_collection",
     "get_vector_store",
     "process_single_document",
     "delete_document_from_qdrant",
