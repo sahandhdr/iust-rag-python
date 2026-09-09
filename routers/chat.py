@@ -1,11 +1,4 @@
 # routers/chat.py
-"""
-Chat routes:
-  POST /chat/ask            — one-shot JSON
-  POST /chat/ask_with_file  — one-shot JSON + uploaded file
-  POST /chat/ask/stream     — SSE (meta, sources, token*, done|error)
-"""
-
 from __future__ import annotations
 
 import json
@@ -14,21 +7,23 @@ import os
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from RAGEngine import RAGEngine, rag_engine_instance
 from auth_rbac import LaravelAuthenticator, UserContext
 from ingest_documents import document_ingestor
 from utils.api_responser import ApiResponser
-from vision_helper import vision_helper_instance
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 optional_bearer = HTTPBearer(auto_error=False)
+
+MAX_QUERY_LEN = 2000
+MAX_SELECTED_TEXT_LEN = 50_000
 
 
 def get_rag_engine() -> RAGEngine:
@@ -36,51 +31,51 @@ def get_rag_engine() -> RAGEngine:
 
 
 class UserContextPayload(BaseModel):
-    user_id: int
-    username: str
+    user_id: int = Field(..., ge=1)
+    username: str = Field(..., min_length=1, max_length=255)
     roles: List[str] = Field(default_factory=list)
     departments: List[str] = Field(default_factory=list)
     permissions: List[str] = Field(default_factory=list)
 
 
 class ChatRequest(BaseModel):
-    query: str
-    session_id: str
-    selected_text: Optional[str] = None
-    msg_id: Optional[str] = None  # accepted but not used for Qdrant filter
+    query: str = Field(..., min_length=1, max_length=MAX_QUERY_LEN)
+    session_id: str = Field(..., min_length=1, max_length=64)
+    selected_text: Optional[str] = Field(None, max_length=MAX_SELECTED_TEXT_LEN)
+    msg_id: Optional[str] = Field(None, max_length=64)
     user_context: Optional[UserContextPayload] = None
+
+    @field_validator("query", "session_id")
+    @classmethod
+    def strip_nonempty(cls, v: str) -> str:
+        if v is None:
+            raise ValueError("required")
+        s = str(v).strip()
+        if not s:
+            raise ValueError("must not be blank")
+        return s
 
 
 async def resolve_user(
     request: ChatRequest,
     credentials: Optional[HTTPAuthorizationCredentials],
 ) -> UserContext:
-    """
-    1) Laravel user_context → no callback
-    2) else Bearer → verify_token
-    """
     if request.user_context is not None:
-        try:
-            return UserContext.model_validate(request.user_context.model_dump())
-        except Exception as exc:
-            logger.exception("Invalid user_context from Laravel proxy")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="اطلاعات هویتی نامعتبر است.",
-            ) from exc
-
-    if credentials is not None and credentials.credentials:
+        uc = request.user_context
+        return UserContext(
+            user_id=uc.user_id,
+            username=uc.username,
+            roles=set(uc.roles or []),
+            departments=set(uc.departments or []),
+            permissions=set(uc.permissions or []),
+        )
+    if credentials and credentials.credentials:
         return await LaravelAuthenticator.verify_token(credentials.credentials)
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="توکن احراز هویت ارسال نشده است.",
-    )
+    raise HTTPException(status_code=401, detail="توکن احراز هویت ارسال نشده است.")
 
 
-def _sse_pack(event: str, data: object) -> str:
-    payload = json.dumps(data, ensure_ascii=False)
-    return f"event: {event}\ndata: {payload}\n\n"
+def _sse_pack(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @router.post("/ask")
@@ -119,11 +114,11 @@ async def ask_question(
                 "user_department": sorted(current_user.departments),
             },
         )
-    except Exception as e:
-        logger.exception("Error processing chat request:")
+    except Exception:
+        logger.exception("Error processing chat request")
         return ApiResponser.error_response(
             message="خطایی در پردازش درخواست متنی رخ داد.",
-            errors=str(e),
+            errors="internal-error",
             status_code=500,
         )
 
@@ -134,17 +129,8 @@ async def ask_stream(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_bearer),
     engine: RAGEngine = Depends(get_rag_engine),
 ):
-    """
-    SSE stream. Intended to be proxied by Laravel (not called directly by browser in Phase 1).
-    Events: meta → sources → token* → done | error
-    """
     start_time = time.time()
     current_user = await resolve_user(request, credentials)
-
-    if not request.session_id or not str(request.session_id).strip():
-        raise HTTPException(status_code=422, detail="session_id الزامی است.")
-    if not request.query or not str(request.query).strip():
-        raise HTTPException(status_code=422, detail="query الزامی است.")
 
     logger.info(
         "Stream query from user %s session %s (via_context=%s)",
@@ -185,7 +171,7 @@ async def ask_stream(
                     )
         except Exception as exc:
             logger.exception("ask/stream failed")
-            yield _sse_pack("error", {"message": str(exc)})
+            yield _sse_pack("error", {"message": "stream-failed"})
 
     return StreamingResponse(
         event_generator(),
@@ -200,14 +186,29 @@ async def ask_stream(
 
 @router.post("/ask_with_file")
 async def ask_with_file(
-    query: str = Form(...),
-    session_id: str = Form(...),
+    query: str = Form(..., min_length=1, max_length=MAX_QUERY_LEN),
+    session_id: str = Form(..., min_length=1, max_length=64),
     user_context: Optional[str] = Form(None),
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_bearer),
     engine: RAGEngine = Depends(get_rag_engine),
 ):
     start_time = time.time()
+
+    query = (query or "").strip()
+    session_id = (session_id or "").strip()
+    if not query:
+        return ApiResponser.error_response(
+            message="درخواست نامعتبر است.",
+            errors={"query": "required"},
+            status_code=422,
+        )
+    if not session_id:
+        return ApiResponser.error_response(
+            message="درخواست نامعتبر است.",
+            errors={"session_id": "required"},
+            status_code=422,
+        )
 
     if user_context:
         try:
@@ -231,14 +232,23 @@ async def ask_with_file(
         file.filename,
     )
 
-    temp_path = f"temp_chat_{file.filename}"
+    safe_name = os.path.basename(file.filename or "upload.bin")
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in safe_name)
+    temp_path = f"temp_chat_{safe_name}"
+
     try:
+        content = await file.read()
+        if not content:
+            return ApiResponser.error_response(
+                message="فایل خالی است.",
+                status_code=422,
+            )
+
         with open(temp_path, "wb") as buffer:
-            buffer.write(await file.read())
+            buffer.write(content)
 
-        file_extension = os.path.splitext(file.filename or "")[1].lower()
-
-        if file_extension in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"]:
+        file_extension = os.path.splitext(safe_name)[1].lower()
+        if file_extension in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"}:
             extracted_text = vision_helper_instance.analyze_image(
                 temp_path, analysis_mode="ocr"
             )
@@ -271,11 +281,13 @@ async def ask_with_file(
                 "file_processed": file.filename,
             },
         )
-    except Exception as e:
-        logger.error("Error processing file chat request: %s", str(e), exc_info=True)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Error processing file chat request")
         return ApiResponser.error_response(
             message="خطایی در پردازش فایل رخ داد.",
-            errors=str(e),
+            errors="internal-error",
             status_code=500,
         )
     finally:

@@ -95,7 +95,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.warning("Validation error path=%s detail=%s", request.url.path, exc.errors())
     return ApiResponser.error_response(
         message="درخواست نامعتبر است.",
-        errors=exc.errors() if settings.debug else "validation-error",
+        # errors=exc.errors() if settings.debug else "validation-error",
+        errors=exc.errors(),
         status_code=422,
     )
 
