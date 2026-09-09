@@ -316,6 +316,131 @@ def delete_document_markdown_files(doc_uuid: str) -> int:
                     logger.warning("Failed to remove %s: %s", path, exc)
     return removed
 
+def _safe_doc_uuid_filename(doc_uuid: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9\-_]", "_", str(doc_uuid).strip())
+
+
+def _qdrant_has_doc_uuid(client: QdrantClient, collection_name: str, doc_uuid: str) -> bool:
+    """True if at least one point exists for metadata.doc_uuid."""
+    try:
+        if not client.collection_exists(collection_name=collection_name):
+            return False
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=rest_models.Filter(
+                must=[
+                    rest_models.FieldCondition(
+                        key="metadata.doc_uuid",
+                        match=rest_models.MatchValue(value=doc_uuid),
+                    )
+                ]
+            ),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return bool(points)
+    except Exception as exc:
+        logger.warning("scroll check failed for doc_uuid=%s: %s", doc_uuid, exc)
+        return True  # fail-closed: do not delete if uncertain
+
+
+def cleanup_orphan_data_files(
+    *,
+    dry_run: bool = True,
+    remove_empty_dirs: bool = True,
+    cleanup_temp_ingest: bool = True,
+) -> Dict[str, Any]:
+    """
+    Remove derivative markdown under data_dir when no Qdrant points exist for that doc_uuid.
+    Optionally remove cwd temp_ingest_* leftovers from direct API tests.
+    Never touches Laravel storage or Qdrant collection itself.
+    """
+    settings = get_settings()
+    data_dir = settings.ingestion.data_dir
+    collection_name = settings.db.qdrant_collection
+    client = get_qdrant_client()
+
+    scanned = 0
+    orphans: List[Dict[str, Any]] = []
+    kept = 0
+    removed_files = 0
+    removed_dirs = 0
+    temp_removed = 0
+    errors: List[str] = []
+
+    if os.path.isdir(data_dir):
+        for root, _dirs, files in os.walk(data_dir):
+            for name in files:
+                if not name.lower().endswith(".md"):
+                    continue
+                scanned += 1
+                path = os.path.join(root, name)
+                stem = name[:-3]  # strip .md
+                # stem is safe filename form of doc_uuid
+                in_qdrant = _qdrant_has_doc_uuid(client, collection_name, stem)
+                # also try original if identical
+                if not in_qdrant and stem != name:
+                    in_qdrant = _qdrant_has_doc_uuid(client, collection_name, stem)
+
+                if in_qdrant:
+                    kept += 1
+                    continue
+
+                entry = {"path": path, "doc_uuid_key": stem, "reason": "not-in-qdrant"}
+                orphans.append(entry)
+                if dry_run:
+                    continue
+                try:
+                    os.remove(path)
+                    removed_files += 1
+                    logger.info("Orphan markdown removed: %s", path)
+                except OSError as exc:
+                    errors.append(f"{path}: {exc}")
+
+        if remove_empty_dirs and not dry_run:
+            for root, dirs, files in os.walk(data_dir, topdown=False):
+                if root == os.path.abspath(data_dir) or root == data_dir:
+                    continue
+                if not dirs and not files:
+                    try:
+                        os.rmdir(root)
+                        removed_dirs += 1
+                    except OSError:
+                        pass
+
+    if cleanup_temp_ingest:
+        cwd = os.getcwd()
+        try:
+            for name in os.listdir(cwd):
+                if not name.startswith("temp_ingest_"):
+                    continue
+                path = os.path.join(cwd, name)
+                if not os.path.isfile(path):
+                    continue
+                orphans.append({"path": path, "doc_uuid_key": None, "reason": "temp_ingest"})
+                if dry_run:
+                    continue
+                try:
+                    os.remove(path)
+                    temp_removed += 1
+                except OSError as exc:
+                    errors.append(f"{path}: {exc}")
+        except OSError as exc:
+            errors.append(f"cwd-scan: {exc}")
+
+    return {
+        "data_dir": os.path.abspath(data_dir),
+        "dry_run": dry_run,
+        "scanned_md": scanned,
+        "kept_in_qdrant": kept,
+        "orphan_candidates": len([o for o in orphans if o.get("reason") == "not-in-qdrant"]),
+        "orphans": orphans[:200],
+        "removed_files": removed_files,
+        "removed_empty_dirs": removed_dirs,
+        "temp_ingest_removed": temp_removed,
+        "errors": errors,
+    }
 
 def process_single_document(
     md_path: str,
@@ -520,4 +645,5 @@ __all__ = [
     "delete_document_from_qdrant",
     "delete_document_markdown_files",
     "update_document_metadata_in_qdrant",
+    "cleanup_orphan_data_files",
 ]

@@ -5,10 +5,13 @@ import json
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from typing import Any, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Path, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Path, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from auth_rbac import UserContext, qdrant_sync
 from config import get_settings
@@ -18,13 +21,51 @@ from routers.chat import router as chat_router
 from routers.sync import router as sync_router
 from utils.api_responser import ApiResponser
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("iust_rag")
 settings = get_settings()
+
+if settings.debug:
+    logging.getLogger().setLevel(logging.DEBUG)
+else:
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (startup / shutdown) — fail-safe
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "Starting %s | debug=%s | api_prefix=%s",
+        settings.app_name,
+        settings.debug,
+        settings.api_prefix,
+    )
+    try:
+        # Lightweight readiness: settings loaded; heavy models stay lazy.
+        _ = settings.db.qdrant_collection
+        yield
+    except Exception:
+        logger.exception("Fatal error during application lifespan")
+        raise
+    finally:
+        logger.info("Shutting down %s", settings.app_name)
+
 
 app = FastAPI(
     title="IUST RAG API",
     version="1.0.0",
     description="سیستم RAG مرکز کامپیوتر دانشگاه علم و صنعت - Phase 1/2",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -39,6 +80,55 @@ app.include_router(chat_router, prefix=settings.api_prefix)
 app.include_router(sync_router, prefix=settings.api_prefix)
 
 
+# ---------------------------------------------------------------------------
+# Global exception handlers
+# ---------------------------------------------------------------------------
+def _client_safe_error(exc: Exception) -> str:
+    """Hide internals when debug is off."""
+    if settings.debug:
+        return str(exc) or exc.__class__.__name__
+    return "internal-error"
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning("Validation error path=%s detail=%s", request.url.path, exc.errors())
+    return ApiResponser.error_response(
+        message="درخواست نامعتبر است.",
+        errors=exc.errors() if settings.debug else "validation-error",
+        status_code=422,
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, (dict, list)):
+        message = "خطای درخواست"
+        errors = detail
+    else:
+        message = str(detail) if detail else "خطای درخواست"
+        errors = None
+    return ApiResponser.error_response(
+        message=message,
+        errors=errors,
+        status_code=exc.status_code,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error path=%s method=%s", request.url.path, request.method)
+    return ApiResponser.error_response(
+        message="خطای داخلی سرور رخ داد.",
+        errors=_client_safe_error(exc),
+        status_code=500,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def _parse_json_list(raw: Optional[str], field_name: str) -> Optional[List[str]]:
     if raw is None or str(raw).strip() == "":
         return None
@@ -52,10 +142,6 @@ def _parse_json_list(raw: Optional[str], field_name: str) -> Optional[List[str]]
 
 
 def _parse_overwrite(raw: Optional[str], default: bool = True) -> bool:
-    """
-    Laravel sends overwrite as form string: '1' | '0' | 'true' | 'false'.
-    Default True = Plan A (same doc_uuid replaces previous chunks).
-    """
     if raw is None or str(raw).strip() == "":
         return default
     value = str(raw).strip().lower()
@@ -78,10 +164,6 @@ def _safe_temp_name(filename: Optional[str]) -> str:
 
 
 def _qdrant_chunk_count(doc_uuid: str) -> int:
-    """
-    search_by_doc_uuid returns a list of Qdrant points (scroll API).
-    Older callers may also pass a dict shape from the sync router — support both.
-    """
     info = qdrant_sync.search_by_doc_uuid(doc_uuid, limit=10_000)
     if isinstance(info, list):
         return len(info)
@@ -95,22 +177,34 @@ def _qdrant_chunk_count(doc_uuid: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 @app.get("/check")
+@app.get("/health")
 async def check_health():
     try:
         return ApiResponser.success_response(
             message="Host is up and running",
-            data={"status": "healthy", "version": "1.0.0"},
+            data={
+                "status": "healthy",
+                "version": "1.0.0",
+                "app": settings.app_name,
+                "debug": bool(settings.debug),
+            },
         )
     except Exception as exc:
-        logger.error("Health check failed: %s", exc)
+        logger.exception("Health check failed")
         return ApiResponser.error_response(
             message="خطا در بررسی سلامت سرویس",
-            errors=str(exc),
+            errors=_client_safe_error(exc),
             status_code=500,
         )
 
 
+# ---------------------------------------------------------------------------
+# Ingest
+# ---------------------------------------------------------------------------
 @app.post(f"{settings.api_prefix}/files/ingest")
 async def ingest_file_endpoint(
     file: UploadFile = File(...),
@@ -124,13 +218,6 @@ async def ingest_file_endpoint(
     overwrite: Optional[str] = Form("1"),
     current_user: UserContext = Depends(get_current_user),
 ):
-    """
-    Ingest file into Qdrant with ACL metadata.
-
-    Plan A:
-      - same doc_uuid + overwrite=true → delete old chunks then insert
-      - Laravel publish always sends overwrite=1
-    """
     if not _can_manage_documents(current_user):
         return ApiResponser.error_response(
             message="شما مجوز آپلود سند مرجع را ندارید.",
@@ -208,7 +295,7 @@ async def ingest_file_endpoint(
         )
         return ApiResponser.error_response(
             message="خطا در پردازش فایل",
-            errors=str(exc),
+            errors=_client_safe_error(exc),
             status_code=500,
         )
     finally:
@@ -219,12 +306,14 @@ async def ingest_file_endpoint(
                 logger.warning("Failed to cleanup temp file: %s", cleanup_err)
 
 
+# ---------------------------------------------------------------------------
+# Delete document from Qdrant
+# ---------------------------------------------------------------------------
 @app.delete(f"{settings.api_prefix}/files/{{doc_uuid}}")
 async def delete_document_endpoint(
     doc_uuid: str = Path(..., description="شناسه یکتای سند (doc_uuid)"),
     current_user: UserContext = Depends(get_current_user),
 ):
-    """حذف چانک‌های Qdrant. فایل Laravel و MD روی دیسک را پاک نمی‌کند."""
     if not _can_manage_documents(current_user):
         return ApiResponser.error_response("شما مجوز حذف سند را ندارید.", 403)
 
@@ -266,4 +355,8 @@ async def delete_document_endpoint(
         )
     except Exception:
         logger.exception("Delete error for doc_uuid=%s", doc_uuid)
-        return ApiResponser.error_response("خطا در حذف سند.", 500)
+        return ApiResponser.error_response(
+            message="خطا در حذف سند.",
+            errors="internal-error" if not settings.debug else None,
+            status_code=500,
+        )
