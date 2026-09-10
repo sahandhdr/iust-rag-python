@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iust-rag"
+version = "1.0.0"
+description = "IUST RAG Python AI worker"
+readme = "README.md"
+requires-python = ">=3.11"
+# dependencies از requirements.txt نصب می‌شوند
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

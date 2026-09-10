@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ..access_control.metadata import (
+from access_control.metadata import (
     build_document_metadata,
     normalize_tag,
     normalize_tag_list,

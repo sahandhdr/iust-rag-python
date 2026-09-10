@@ -13,12 +13,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from auth_rbac import UserContext, qdrant_sync
-from config import get_settings
-from dependencies import get_current_user
-from ingest_documents import document_ingestor
-from routers.chat import router as chat_router
-from routers.sync import router as sync_router
+from auth.rbac import UserContext, qdrant_sync
+from config.settings import get_settings
+from utils.dependencies import get_current_user
+from ingest.documents import document_ingestor
+from api.chat import router as chat_router
+from api.sync import router as sync_router
 from utils.api_responser import ApiResponser
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ from typing import Optional
 # اضافه کردن مسیر پروژه برای import
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from create_database import get_vector_store
+from ingest.database import get_vector_store
 from qdrant_client.http import models as rest
 
 logger = logging.getLogger(__name__)

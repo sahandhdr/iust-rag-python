@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.local
+.idea/
+data/**/*.md
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+*.log
+.pytest_cache/
+.mypy_cache/
