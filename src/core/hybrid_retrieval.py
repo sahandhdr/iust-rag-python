@@ -14,7 +14,7 @@ from auth.rbac import UserContext, RBACManager
 from config.settings import get_settings
 from ingest.database import ensure_hybrid_collection
 from models.embeddings import get_embedding_function
-from sparse_encoder import get_sparse_encoder
+from core.sparse_encoder import get_sparse_encoder
 
 logger = logging.getLogger(__name__)
 

@@ -23,7 +23,7 @@ from qdrant_client.http import models as rest
 from auth.rbac import RBACManager, UserContext
 from config.settings import get_settings
 from models.llm import get_llm
-from hybrid_retrieval import hybrid_search
+from core.hybrid_retrieval import hybrid_search
 
 logger = logging.getLogger(__name__)
 
