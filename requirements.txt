@@ -1,32 +1,49 @@
-# --- FastAPI & Web ---
-fastapi
-uvicorn[standard]
-pydantic
-pydantic-settings
-python-multipart
-httpx
+# =============================================================================
+# IUST RAG — Python AI Worker
+# Production requirements (Docker + local)
+# Python >= 3.11 recommended (3.12 ideal for Docker image)
+# =============================================================================
 
-# --- Environment & Utils ---
-python-dotenv
-pytest
+# --- FastAPI & HTTP ---
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.32.0,<1.0.0
+pydantic>=2.9.0,<3.0.0
+pydantic-settings>=2.6.0,<3.0.0
+python-multipart>=0.0.12
+httpx>=0.27.0,<1.0.0
 
-# --- LangChain Ecosystem ---
-langchain
-langchain-core
-langchain-community
-langchain-openai
-langchain-chroma
-langgraph
-langchain-text-splitters
+# --- Env & tooling ---
+python-dotenv>=1.0.0
+pytest>=8.0.0
 
-# --- Vector Database ---
-qdrant-client
-langchain-qdrant
+# --- LangChain / LangGraph ---
+langchain>=0.3.0,<2.0.0
+langchain-core>=0.3.0,<2.0.0
+langchain-community>=0.3.0,<1.0.0
+langchain-openai>=0.2.0,<2.0.0
+langchain-text-splitters>=0.3.0,<2.0.0
+langgraph>=0.2.0,<2.0.0
 
-# --- Document Processing & OCR ---
-pypdf
-docx2txt
-unstructured
-docling
-pdfplumber
-PIL
+# --- Vector DB (Hybrid dense+sparse on Qdrant) ---
+qdrant-client>=1.12.0,<2.0.0
+langchain-qdrant>=0.2.0,<2.0.0
+
+# --- OpenAI-compatible clients (GapGPT / custom base_url) ---
+openai>=1.40.0,<2.0.0
+tiktoken>=0.7.0
+
+# --- Document ingest ---
+pypdf>=5.0.0
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+docx2txt>=0.8
+# OCR / heavy parsers (optional at runtime; keep if you use scanned PDF / complex docs)
+unstructured>=0.15.0
+docling>=2.0.0
+
+# --- Images (import is: from PIL import Image) ---
+Pillow>=10.0.0
+
+# --- Optional / legacy (NOT used by current Hybrid Qdrant path) ---
+# اگر جایی از Chroma استفاده نمی‌کنید می‌توانید خط زیر را حذف کنید تا build سبک‌تر شود:
+# langchain-chroma>=0.1.0
