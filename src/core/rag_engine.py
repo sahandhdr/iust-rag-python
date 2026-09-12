@@ -1,17 +1,25 @@
 # rag_engine.py
 """
-RAGEngine — LangGraph retrieve → generate with Hybrid Qdrant search + RBAC.
+RAGEngine — LangGraph retrieve → generate with Hybrid Qdrant + RBAC + session memory.
 
-Production rule:
-  If retrieval returns no sources and the user did not upload a file,
-  do NOT call the LLM. Return a fixed «no knowledge» message.
+Memory:
+  - Per thread_id = user:{user_id}:session:{session_id}
+  - Last N turns injected into the LLM prompt (not only LangGraph checkpoint)
+  - Source of continuity for the running process (MemorySaver is auxiliary)
+
+Production rules:
+  - If no org sources, no user file, and no prior dialogue → fixed empty answer (no LLM).
+  - If no org sources but dialogue history exists (or user file) → LLM allowed in
+    dialogue/file mode; must NOT invent organizational facts.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, TypedDict
+import threading
+from collections import defaultdict, deque
+from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Tuple, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -22,8 +30,8 @@ from qdrant_client.http import models as rest
 
 from auth.rbac import RBACManager, UserContext
 from config.settings import get_settings
-from models.llm import get_llm
 from core.hybrid_retrieval import hybrid_search
+from models.llm import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,9 @@ EMPTY_KNOWLEDGE_ANSWER = (
     "در پایگاه دانش و اسناد منتشرشدهٔ مرکز کامپیوتر دانشگاه علم و صنعت ایران، "
     "اطلاعاتی در این مورد پیدا نشد. لطفاً سؤال را دقیق‌تر بپرسید یا با پشتیبانی مرکز تماس بگیرید."
 )
+
+# Max human+ai pairs kept per session in process memory
+DEFAULT_MAX_HISTORY_TURNS = 12
 
 
 class RAGState(TypedDict):
@@ -42,16 +53,19 @@ class RAGState(TypedDict):
     org_context: str
     sources: List[Dict[str, Any]]
     answer: str
+    thread_id: str
+    chat_history_text: str
 
 
 BASE_RULES = (
     "قوانین مهم و غیرقابل نقض:\n"
     "- فقط و فقط بر اساس اطلاعات موجود در بخش «دانش سازمانی» و (در صورت وجود) "
-    "«محتوای فایل کاربر» پاسخ بده.\n"
-    "- هیچ ساعت کاری، نام فرد، سمت، شماره تماس، آدرس یا واقعیت دیگری را از دانش عمومی "
+    "«محتوای فایل کاربر» و «تاریخچه گفتگو» پاسخ بده.\n"
+    "- هیچ ساعت کاری، نام فرد سازمانی، سمت، شماره تماس، آدرس یا واقعیت سازمانی را از دانش عمومی "
     "یا حدس خودت اضافه نکن.\n"
-    "- اگر در دانش سازمانی چیزی مرتبط نیست، فقط بگو اطلاعات در اسناد موجود نیست؛ "
+    "- اگر در دانش سازمانی چیزی مرتبط نیست، برای سؤالات سازمانی بگو اطلاعات در اسناد موجود نیست؛ "
     "جزئیات ساختگی ننویس.\n"
+    "- از تاریخچه گفتگو فقط برای پیوستگی مکالمه (مثل نام کاربر یا ترجیحات گفته‌شده در همین نشست) استفاده کن.\n"
     "- اگر در دانش سازمانی اطلاعات متناقض وجود دارد (مثلاً دو ساعت کاری مختلف):\n"
     "  • هر دو نسخه را ذکر کن.\n"
     "  • تا حد امکان منبع هر نسخه را مشخص کن.\n"
@@ -64,12 +78,59 @@ BASE_RULES = (
 )
 
 
+class SessionConversationMemory:
+    """
+    Process-local conversation buffer.
+    Survives across asks in the same uvicorn worker; cleared on process restart.
+    For multi-worker production, replace with Redis later.
+    """
+
+    def __init__(self, max_turns: int = DEFAULT_MAX_HISTORY_TURNS) -> None:
+        self._max_turns = max(1, int(max_turns))
+        self._lock = threading.Lock()
+        self._store: Dict[str, Deque[Tuple[str, str]]] = defaultdict(
+            lambda: deque(maxlen=self._max_turns)
+        )
+
+    def get_turns(self, thread_id: str) -> List[Tuple[str, str]]:
+        with self._lock:
+            return list(self._store.get(thread_id, ()))
+
+    def append_turn(self, thread_id: str, human: str, ai: str) -> None:
+        human = (human or "").strip()
+        ai = (ai or "").strip()
+        if not human:
+            return
+        with self._lock:
+            self._store[thread_id].append((human, ai))
+
+    def format_for_prompt(self, thread_id: str) -> str:
+        turns = self.get_turns(thread_id)
+        if not turns:
+            return ""
+        lines: List[str] = []
+        for human, ai in turns:
+            lines.append(f"کاربر: {human}")
+            if ai:
+                lines.append(f"دستیار: {ai}")
+        return "\n".join(lines)
+
+    def clear(self, thread_id: str) -> None:
+        with self._lock:
+            self._store.pop(thread_id, None)
+
+
+# Shared across RAGEngine instances in this process
+_conversation_memory = SessionConversationMemory()
+
+
 class RAGEngine:
     def __init__(self) -> None:
-        logger.info("Initializing RAG Engine (Hybrid Qdrant + RBAC)...")
+        logger.info("Initializing RAG Engine (Hybrid Qdrant + RBAC + session memory)...")
         self.llm = get_llm()
         self.rbac_manager = RBACManager()
         self.retrieval_k = get_settings().ai.retrieval_k
+        self.memory = _conversation_memory
         self.app = self._build_graph()
 
     def _build_graph(self):
@@ -143,6 +204,9 @@ class RAGEngine:
     def _has_user_file(self, user_file_content: Optional[str]) -> bool:
         return bool(user_file_content and str(user_file_content).strip())
 
+    def _has_history(self, chat_history_text: str) -> bool:
+        return bool(chat_history_text and str(chat_history_text).strip())
+
     async def _retrieve_for_query(
         self,
         question: str,
@@ -165,7 +229,25 @@ class RAGEngine:
         self,
         org_context: str,
         user_file_content: Optional[str],
+        chat_history_text: str,
+        *,
+        dialogue_only: bool = False,
     ) -> str:
+        history_block = ""
+        if chat_history_text and chat_history_text.strip():
+            history_block = f"\n\nتاریخچه گفتگوی همین نشست:\n{chat_history_text.strip()}\n"
+
+        if dialogue_only:
+            return (
+                "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
+                "در این نوبت دانش سازمانی بازیابی‌شده خالی است.\n"
+                f"{BASE_RULES}\n"
+                "- برای سؤالات سازمانی بگو در اسناد منتشرشده چیزی پیدا نشد.\n"
+                "- برای پیوستگی مکالمه (نام کاربر، موارد گفته‌شده در همین چت) از تاریخچه استفاده کن.\n"
+                f"{history_block}"
+                "دانش سازمانی:\n(خالی)\n"
+            )
+
         if user_file_content:
             return (
                 "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
@@ -177,14 +259,17 @@ class RAGEngine:
                 "- اگر فایل کاربر با اسناد رسمی تعارض دارد، اسناد رسمی را مقدم بدان و تعارض را ذکر کن.\n"
                 "- اگر سؤال مستقیماً دربارهٔ فایل آپلود‌شده است، آن را با دقت تحلیل کن.\n"
                 "- اگر دانش سازمانی خالی است و فقط فایل کاربر موجود است، فقط بر اساس فایل پاسخ بده "
-                "و ادعا نکن که از اسناد رسمی مرکز آمده است.\n\n"
+                "و ادعا نکن که از اسناد رسمی مرکز آمده است.\n"
+                f"{history_block}"
                 f"دانش سازمانی:\n{org_context}\n\n"
                 f"محتوای فایل کاربر:\n{user_file_content}"
             )
+
         return (
             "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
             "فقط به دانش سازمانی رسمی (اسناد مرکز) دسترسی داری.\n\n"
             f"{BASE_RULES}\n"
+            f"{history_block}"
             f"دانش سازمانی:\n{org_context}"
         )
 
@@ -204,61 +289,54 @@ class RAGEngine:
         question = state["question"]
         org_context = state.get("org_context", "") or ""
         sources = state.get("sources") or []
+        history_text = state.get("chat_history_text", "") or ""
+        thread_id = state.get("thread_id") or ""
 
-        # Production guard: no org evidence and no user file → fixed message, no LLM.
-        if not self._has_org_evidence(org_context, sources) and not self._has_user_file(
-            user_file
-        ):
+        has_org = self._has_org_evidence(org_context, sources)
+        has_file = self._has_user_file(user_file)
+        has_hist = self._has_history(history_text)
+
+        # Truly cold start: no evidence, no file, no prior turns → fixed message
+        if not has_org and not has_file and not has_hist:
             logger.warning(
-                "Empty retrieval and no user file | session=%s | skipping LLM",
+                "Empty retrieval, no file, no history | session=%s | skipping LLM",
                 state["session_id"],
             )
-            return {"answer": EMPTY_KNOWLEDGE_ANSWER}
-
-        if self._has_user_file(user_file):
-            system_with_vars = (
-                "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
-                "دو منبع اطلاعاتی در اختیار داری:\n"
-                "۱) دانش سازمانی رسمی (اسناد مرکز)\n"
-                "۲) محتوای فایلی که کاربر آپلود کرده\n\n"
-                f"{BASE_RULES}\n"
-                "- در سؤالات مربوط به دانشگاه و مرکز، اولویت با دانش سازمانی رسمی است.\n"
-                "- اگر فایل کاربر با اسناد رسمی تعارض دارد، اسناد رسمی را مقدم بدان و تعارض را ذکر کن.\n"
-                "- اگر سؤال مستقیماً دربارهٔ فایل آپلود‌شده است، آن را با دقت تحلیل کن.\n"
-                "- اگر دانش سازمانی خالی است و فقط فایل کاربر موجود است، فقط بر اساس فایل پاسخ بده "
-                "و ادعا نکن که از اسناد رسمی مرکز آمده است.\n\n"
-                "دانش سازمانی:\n{org_context}\n\n"
-                "محتوای فایل کاربر:\n{user_file_content}"
-            )
-            prompt = ChatPromptTemplate.from_messages(
-                [("system", system_with_vars), ("human", "{question}")]
-            )
-            chain = prompt | self.llm | StrOutputParser()
-            answer = await chain.ainvoke(
-                {
-                    "org_context": org_context,
-                    "user_file_content": user_file,
-                    "question": question,
-                }
-            )
+            answer = EMPTY_KNOWLEDGE_ANSWER
+            if thread_id:
+                self.memory.append_turn(thread_id, question, answer)
             return {"answer": answer}
 
-        system_with_vars = (
-            "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
-            "فقط به دانش سازمانی رسمی (اسناد مرکز) دسترسی داری.\n\n"
-            f"{BASE_RULES}\n"
-            "دانش سازمانی:\n{org_context}"
+        dialogue_only = not has_org and not has_file and has_hist
+
+        system_text = self._build_system_prompt(
+            org_context,
+            user_file if has_file else None,
+            history_text,
+            dialogue_only=dialogue_only,
         )
-        prompt = ChatPromptTemplate.from_messages(
-            [("system", system_with_vars), ("human", "{question}")]
-        )
-        chain = prompt | self.llm | StrOutputParser()
-        answer = await chain.ainvoke(
-            {
-                "org_context": org_context,
-                "question": question,
-            }
-        )
+
+        messages = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=question),
+        ]
+
+        try:
+            response = await self.llm.ainvoke(messages)
+            answer = getattr(response, "content", None) or str(response)
+            if isinstance(answer, list):
+                answer = "".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in answer
+                )
+            answer = str(answer).strip()
+        except Exception:
+            logger.exception("LLM invoke failed | session=%s", state["session_id"])
+            answer = EMPTY_KNOWLEDGE_ANSWER
+
+        if thread_id:
+            self.memory.append_turn(thread_id, question, answer)
+
         return {"answer": answer}
 
     async def query(
@@ -272,6 +350,7 @@ class RAGEngine:
         user_context_dict = self._user_context_to_dict(user_context)
         thread_id = self._build_thread_id(user_context, session_id)
         config = {"configurable": {"thread_id": thread_id}}
+        history_text = self.memory.format_for_prompt(thread_id)
 
         initial_state: RAGState = {
             "question": question,
@@ -282,6 +361,8 @@ class RAGEngine:
             "org_context": "",
             "sources": [],
             "answer": "",
+            "thread_id": thread_id,
+            "chat_history_text": history_text,
         }
 
         result = await self.app.ainvoke(initial_state, config=config)
@@ -294,6 +375,9 @@ class RAGEngine:
         user_context: UserContext,
         user_file_content: Optional[str] = None,
     ) -> AsyncIterator[Tuple[str, Any]]:
+        thread_id = self._build_thread_id(user_context, session_id)
+        history_text = self.memory.format_for_prompt(thread_id)
+
         org_context, sources = await self._retrieve_for_query(
             question=question,
             user_context=user_context,
@@ -301,19 +385,27 @@ class RAGEngine:
         )
         yield ("sources", sources)
 
-        # Same production guard for SSE path.
-        if not self._has_org_evidence(org_context, sources) and not self._has_user_file(
-            user_file_content
-        ):
-            logger.warning(
-                "Empty retrieval and no user file | session=%s | stream skip LLM",
-                session_id,
-            )
-            yield ("token", EMPTY_KNOWLEDGE_ANSWER)
-            yield ("done", {"answer": EMPTY_KNOWLEDGE_ANSWER})
-            return
+        has_org = self._has_org_evidence(org_context, sources)
+        has_file = self._has_user_file(user_file_content)
+        has_hist = self._has_history(history_text)
 
-        system_text = self._build_system_prompt(org_context, user_file_content)
+        # if not has_org and not has_file and not has_hist:
+        #     logger.warning(
+        #         "Empty retrieval, no file, no history | session=%s | stream skip LLM",
+        #         session_id,
+        #     )
+        #     self.memory.append_turn(thread_id, question, EMPTY_KNOWLEDGE_ANSWER)
+        #     yield ("token", EMPTY_KNOWLEDGE_ANSWER)
+        #     yield ("done", {"answer": EMPTY_KNOWLEDGE_ANSWER})
+        #     return
+
+        dialogue_only = not has_org and not has_file and has_hist
+        system_text = self._build_system_prompt(
+            org_context,
+            user_file_content if has_file else None,
+            history_text,
+            dialogue_only=dialogue_only,
+        )
         messages = [
             SystemMessage(content=system_text),
             HumanMessage(content=question),
@@ -331,10 +423,12 @@ class RAGEngine:
                 )
             if not text:
                 continue
-            full_parts.append(text)
+            full_parts.append(str(text))
             yield ("token", text)
 
-        yield ("done", {"answer": "".join(full_parts)})
+        full_answer = "".join(full_parts).strip() or EMPTY_KNOWLEDGE_ANSWER
+        self.memory.append_turn(thread_id, question, full_answer)
+        yield ("done", {"answer": full_answer})
 
 
 rag_engine_instance = RAGEngine()

@@ -23,6 +23,7 @@ import pdfplumber
 from docling.document_converter import DocumentConverter
 
 from config.settings import get_settings
+from ingest.database import process_single_document
 from utils.vision_helper import vision_helper_instance
 
 logger = logging.getLogger(__name__)
@@ -168,8 +169,6 @@ class DocumentIngestor:
             perms_list = None
             if permissions is not None:
                 perms_list = [str(p).strip() for p in permissions if str(p).strip()]
-
-            from database import process_single_document
 
             result = process_single_document(
                 md_path=md_path,

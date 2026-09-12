@@ -26,7 +26,7 @@ class LLMFactory:
 
             try:
                 if settings.ai.llm_provider == "ollama":
-                    from langchain_community.chat_models import ChatOllama
+                    from langchain_ollama import ChatOllama  # نه langchain_community
                     instance = ChatOllama(
                         model=settings.ai.llm_model,
                         base_url=settings.ai.llm_base_url,
