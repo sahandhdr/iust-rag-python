@@ -81,6 +81,29 @@ class DocumentIngestor:
     def _ocr_image(self, image_path: str) -> str:
         return self.vision.analyze_image(image_path, analysis_mode="ocr")
 
+    def _persian_text_quality(text: str) -> float:
+        if not text or not text.strip():
+            return 0.0
+        t = text.strip()
+        persian = sum(1 for ch in t if "\u0600" <= ch <= "\u06FF")
+        letters = sum(1 for ch in t if ch.isalpha() or ("\u0600" <= ch <= "\u06FF"))
+        if letters == 0:
+            return 0.0
+        return persian / max(len(t), 1)  # یا persian/letters
+
+    def _extract_pdf_pymupdf(path: str) -> str:
+        import fitz
+        doc = fitz.open(path)
+        parts = []
+        for i, page in enumerate(doc):
+            parts.append(page.get_text("text") or "")
+        doc.close()
+        return "\n\n".join(parts)
+
+    # در extract برای pdf:
+    # 1) pymupdf text
+    # 2) if quality low or short → existing _ocr_pdf (pdfplumber image + vision)
+
     def extract_text_from_file(self, file_path: str) -> Optional[str]:
         """Extract text for supported formats. Returns None on hard failure."""
         ext = Path(file_path).suffix.lower().lstrip(".")

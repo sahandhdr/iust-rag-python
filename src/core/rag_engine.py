@@ -4,13 +4,11 @@ RAGEngine — LangGraph retrieve → generate with Hybrid Qdrant + RBAC + sessio
 
 Memory:
   - Per thread_id = user:{user_id}:session:{session_id}
-  - Last N turns injected into the LLM prompt (not only LangGraph checkpoint)
-  - Source of continuity for the running process (MemorySaver is auxiliary)
+  - Last N turns injected into the LLM prompt
 
-Production rules:
-  - If no org sources, no user file, and no prior dialogue → fixed empty answer (no LLM).
-  - If no org sources but dialogue history exists (or user file) → LLM allowed in
-    dialogue/file mode; must NOT invent organizational facts.
+Retrieve resilience:
+  - If embedding/Qdrant fails, return empty context (do not 500 the whole ask)
+  - Then dialogue mode can still answer from conversation history / chat-only rules
 """
 
 from __future__ import annotations
@@ -22,8 +20,6 @@ from collections import defaultdict, deque
 from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Tuple, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from qdrant_client.http import models as rest
@@ -33,6 +29,8 @@ from config.settings import get_settings
 from core.hybrid_retrieval import hybrid_search
 from models.llm import get_llm
 
+from core.conversation_memory import build_conversation_memory_from_settings
+
 logger = logging.getLogger(__name__)
 
 EMPTY_KNOWLEDGE_ANSWER = (
@@ -40,7 +38,6 @@ EMPTY_KNOWLEDGE_ANSWER = (
     "اطلاعاتی در این مورد پیدا نشد. لطفاً سؤال را دقیق‌تر بپرسید یا با پشتیبانی مرکز تماس بگیرید."
 )
 
-# Max human+ai pairs kept per session in process memory
 DEFAULT_MAX_HISTORY_TURNS = 12
 
 
@@ -79,11 +76,7 @@ BASE_RULES = (
 
 
 class SessionConversationMemory:
-    """
-    Process-local conversation buffer.
-    Survives across asks in the same uvicorn worker; cleared on process restart.
-    For multi-worker production, replace with Redis later.
-    """
+    """Process-local conversation buffer (one uvicorn worker)."""
 
     def __init__(self, max_turns: int = DEFAULT_MAX_HISTORY_TURNS) -> None:
         self._max_turns = max(1, int(max_turns))
@@ -120,9 +113,8 @@ class SessionConversationMemory:
             self._store.pop(thread_id, None)
 
 
-# Shared across RAGEngine instances in this process
-_conversation_memory = SessionConversationMemory()
-
+# _conversation_memory = SessionConversationMemory()
+_conversation_memory = build_conversation_memory_from_settings()
 
 class RAGEngine:
     def __init__(self) -> None:
@@ -213,6 +205,10 @@ class RAGEngine:
         user_context: UserContext,
         session_id: str,
     ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Never raise to the HTTP layer: embedding/Qdrant outage → empty retrieval
+        so generate can fall back to dialogue mode or fixed empty policy.
+        """
         logger.info("Hybrid retrieving org context | session=%s", session_id)
 
         def _run():
@@ -222,8 +218,16 @@ class RAGEngine:
                 k=self.retrieval_k,
             )
 
-        org_context, sources = await asyncio.to_thread(_run)
-        return org_context or "", sources or []
+        try:
+            org_context, sources = await asyncio.to_thread(_run)
+            return org_context or "", sources or []
+        except Exception as exc:
+            logger.exception(
+                "Retrieval failed (embedding/Qdrant) | session=%s | err=%s",
+                session_id,
+                exc,
+            )
+            return "", []
 
     def _build_system_prompt(
         self,
@@ -235,12 +239,14 @@ class RAGEngine:
     ) -> str:
         history_block = ""
         if chat_history_text and chat_history_text.strip():
-            history_block = f"\n\nتاریخچه گفتگوی همین نشست:\n{chat_history_text.strip()}\n"
+            history_block = (
+                f"\n\nتاریخچه گفتگوی همین نشست:\n{chat_history_text.strip()}\n"
+            )
 
         if dialogue_only:
             return (
                 "تو یک دستیار پشتیبانی هوشمند مرکز کامپیوتر دانشگاه علم و صنعت ایران هستی.\n\n"
-                "در این نوبت دانش سازمانی بازیابی‌شده خالی است.\n"
+                "در این نوبت دانش سازمانی بازیابی‌شده خالی است یا در دسترس نیست.\n"
                 f"{BASE_RULES}\n"
                 "- برای سؤالات سازمانی بگو در اسناد منتشرشده چیزی پیدا نشد.\n"
                 "- برای پیوستگی مکالمه (نام کاربر، موارد گفته‌شده در همین چت) از تاریخچه استفاده کن.\n"
@@ -294,20 +300,9 @@ class RAGEngine:
 
         has_org = self._has_org_evidence(org_context, sources)
         has_file = self._has_user_file(user_file)
-        has_hist = self._has_history(history_text)
 
-        # Truly cold start: no evidence, no file, no prior turns → fixed message
-        if not has_org and not has_file and not has_hist:
-            logger.warning(
-                "Empty retrieval, no file, no history | session=%s | skipping LLM",
-                state["session_id"],
-            )
-            answer = EMPTY_KNOWLEDGE_ANSWER
-            if thread_id:
-                self.memory.append_turn(thread_id, question, answer)
-            return {"answer": answer}
-
-        dialogue_only = not has_org and not has_file and has_hist
+        # No org hits and no upload → dialogue (memory / chat-only); never invent org facts
+        dialogue_only = not has_org and not has_file
 
         system_text = self._build_system_prompt(
             org_context,
@@ -329,7 +324,7 @@ class RAGEngine:
                     block.get("text", "") if isinstance(block, dict) else str(block)
                     for block in answer
                 )
-            answer = str(answer).strip()
+            answer = str(answer).strip() or EMPTY_KNOWLEDGE_ANSWER
         except Exception:
             logger.exception("LLM invoke failed | session=%s", state["session_id"])
             answer = EMPTY_KNOWLEDGE_ANSWER
@@ -387,19 +382,8 @@ class RAGEngine:
 
         has_org = self._has_org_evidence(org_context, sources)
         has_file = self._has_user_file(user_file_content)
-        has_hist = self._has_history(history_text)
+        dialogue_only = not has_org and not has_file
 
-        # if not has_org and not has_file and not has_hist:
-        #     logger.warning(
-        #         "Empty retrieval, no file, no history | session=%s | stream skip LLM",
-        #         session_id,
-        #     )
-        #     self.memory.append_turn(thread_id, question, EMPTY_KNOWLEDGE_ANSWER)
-        #     yield ("token", EMPTY_KNOWLEDGE_ANSWER)
-        #     yield ("done", {"answer": EMPTY_KNOWLEDGE_ANSWER})
-        #     return
-
-        dialogue_only = not has_org and not has_file and has_hist
         system_text = self._build_system_prompt(
             org_context,
             user_file_content if has_file else None,
@@ -412,19 +396,24 @@ class RAGEngine:
         ]
 
         full_parts: List[str] = []
-        async for chunk in self.llm.astream(messages):
-            text = getattr(chunk, "content", None)
-            if text is None:
-                continue
-            if isinstance(text, list):
-                text = "".join(
-                    block.get("text", "") if isinstance(block, dict) else str(block)
-                    for block in text
-                )
-            if not text:
-                continue
-            full_parts.append(str(text))
-            yield ("token", text)
+        try:
+            async for chunk in self.llm.astream(messages):
+                text = getattr(chunk, "content", None)
+                if text is None:
+                    continue
+                if isinstance(text, list):
+                    text = "".join(
+                        block.get("text", "") if isinstance(block, dict) else str(block)
+                        for block in text
+                    )
+                if not text:
+                    continue
+                full_parts.append(str(text))
+                yield ("token", text)
+        except Exception:
+            logger.exception("LLM stream failed | session=%s", session_id)
+            full_parts = [EMPTY_KNOWLEDGE_ANSWER]
+            yield ("token", EMPTY_KNOWLEDGE_ANSWER)
 
         full_answer = "".join(full_parts).strip() or EMPTY_KNOWLEDGE_ANSWER
         self.memory.append_turn(thread_id, question, full_answer)

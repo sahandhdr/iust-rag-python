@@ -35,7 +35,7 @@ class VisionHelper:
 
         model = ChatOpenAI(
             model=settings.ai.gapgpt_vision_model,
-            api_key=settings.ai.gapgpt_api_key,
+            api_key=settings.ai.gapgpt_api_key or "not-needed",
             base_url=settings.ai.gapgpt_base_url,
             temperature=0.0
         )

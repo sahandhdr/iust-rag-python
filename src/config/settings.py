@@ -73,6 +73,10 @@ class DatabaseSettings(BaseModel):
     qdrant_collection: str = Field(default="iust_knowledge")
     mysql_dsn: str = Field(default="")
 
+class RedisSettings(BaseModel):
+    url: str = Field(default="redis://127.0.0.1:6379/0")
+    memory_ttl_seconds: int = Field(default=604_800, ge=60)
+    memory_max_turns: int = Field(default=12, ge=2, le=50)
 
 class IngestionSettings(BaseModel):
     """Document ingest / chunking defaults."""
