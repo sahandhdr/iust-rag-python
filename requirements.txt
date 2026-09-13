@@ -48,6 +48,6 @@ Pillow>=10.0.0
 # اگر جایی از Chroma استفاده نمی‌کنید می‌توانید خط زیر را حذف کنید تا build سبک‌تر شود:
 # langchain-chroma>=0.1.0
 
-redis>=5.0.0,<6.0.0
+redis>=5.0.0
 pymupdf>=1.24.0
 fitz

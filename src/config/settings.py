@@ -173,6 +173,7 @@ class Settings(BaseSettings):
     db: DatabaseSettings = DatabaseSettings()
     ingestion: IngestionSettings = IngestionSettings()
     rbac: RbacSettings = Field(default_factory=RbacSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
 
     model_config = SettingsConfigDict(
         env_file=".env",
