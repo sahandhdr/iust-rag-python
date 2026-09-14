@@ -20,6 +20,7 @@ from ingest.documents import document_ingestor
 from api.chat import router as chat_router
 from api.sync import router as sync_router
 from utils.api_responser import ApiResponser
+from api.embed import router as embed_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,17 +69,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# به‌جای allow_origins=["*"]
+_cors_raw = os.getenv("CORS_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()] if _cors_raw else []
+# dev fallback فقط وقتی DEBUG
+if not _cors_origins and settings.debug:
+    _cors_origins = ["*"]
+elif not _cors_origins:
+    _cors_origins = []  # production بدون origin = مرورگر cross-origin بلاک
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins or ["http://127.0.0.1:8000"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Internal-Key", "Accept"],
 )
 
 app.include_router(chat_router, prefix=settings.api_prefix)
 app.include_router(sync_router, prefix=settings.api_prefix)
-
+app.include_router(embed_router, prefix=settings.api_prefix)
 
 # ---------------------------------------------------------------------------
 # Global exception handlers
@@ -184,15 +194,17 @@ def _qdrant_chunk_count(doc_uuid: str) -> int:
 @app.get("/check")
 @app.get("/health")
 async def check_health():
+    data = {
+        "status": "healthy",
+        "version": "1.0.0",
+        "app": settings.app_name,
+    }
+    if settings.debug:
+        data["debug"] = True
     try:
         return ApiResponser.success_response(
             message="Host is up and running",
-            data={
-                "status": "healthy",
-                "version": "1.0.0",
-                "app": settings.app_name,
-                "debug": bool(settings.debug),
-            },
+            data=data
         )
     except Exception as exc:
         logger.exception("Health check failed")
