@@ -23,6 +23,7 @@ langchain-community>=0.3.0,<1.0.0
 langchain-openai>=0.2.0,<2.0.0
 langchain-text-splitters>=0.3.0,<2.0.0
 langgraph>=0.2.0,<2.0.0
+langchain_ollama
 
 # --- Vector DB (Hybrid dense+sparse on Qdrant) ---
 qdrant-client>=1.12.0,<2.0.0
@@ -50,4 +51,3 @@ Pillow>=10.0.0
 
 redis>=5.0.0
 pymupdf>=1.24.0
-fitz
