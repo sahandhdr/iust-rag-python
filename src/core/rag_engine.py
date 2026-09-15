@@ -8,13 +8,21 @@ Memory:
 
 Retrieve resilience:
   - If embedding/Qdrant fails, return empty context (do not 500 the whole ask)
-  - Then dialogue mode can still answer from conversation history / chat-only rules
+
+Query expansion (retrieval only):
+  - Institutional synonyms (فاوا ↔ مرکز کامپیوتر)
+
+People-query completeness:
+  - Reorder context blocks so presidency/staff sections are not buried
+  - Extract name/title lines from full org_context and inject as mandatory checklist
+  - Extra HumanMessage instruction for people questions
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from collections import defaultdict, deque
 from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Tuple, TypedDict
@@ -40,6 +48,172 @@ EMPTY_KNOWLEDGE_ANSWER = (
 
 DEFAULT_MAX_HISTORY_TURNS = 12
 
+_RETRIEVAL_SYNONYM_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    (
+        "فاوا",
+        "فناوری اطلاعات",
+        "فناوری اطلاعات و ارتباطات",
+        "مرکز فاوا",
+        "مرکز فناوری اطلاعات",
+        "مرکز فناوری اطلاعات و ارتباطات",
+        "مرکز کامپیوتر",
+        "مرکز رایانه",
+        "مرکز کامپیوتر دانشگاه",
+    ),
+)
+
+_PEOPLE_QUERY_MARKERS = (
+    "افراد",
+    "فرد",
+    "پرسنل",
+    "کارکنان",
+    "کارمند",
+    "نیروها",
+    "نیروی",
+    "ریاست",
+    "رئیس",
+    "معاون",
+    "مدیران",
+    "مدیر",
+    "کارشناس",
+    "مسئول",
+    "مشاور",
+    "چه کسانی",
+    "کی هست",
+    "اسم",
+    "نام ",
+)
+
+_CONTEXT_PRIORITY_MARKERS = (
+    "ریاست",
+    "رئیس مرکز",
+    "لاریجانی",
+    "معاونت",
+    "معاون مرکز",
+    "مدیران ارشد",
+)
+
+# Lines likely to carry person + role
+_PERSON_LINE_RE = re.compile(
+    r"(?m)^[ \t]*(?:[-*•·]|\d+[\.\)]\s*)?.{0,120}?"
+    r"(?:دکتر|مهندس|ریاست|رئیس|معاون|مشاور|مسئول|کارشناس|مدیر)."
+    r"{2,200}$"
+)
+
+
+def expand_query_for_retrieval(question: str) -> str:
+    q = (question or "").strip()
+    if not q:
+        return q
+
+    q_norm = q
+    extras: List[str] = []
+
+    for group in _RETRIEVAL_SYNONYM_GROUPS:
+        hit = any(term and term in q_norm for term in group)
+        if not hit:
+            continue
+        for term in group:
+            if term and term not in q_norm and term not in extras:
+                extras.append(term)
+
+    if not extras:
+        return q
+
+    extras = extras[:6]
+    return f"{q} (هم‌معنی سازمانی: {' ؛ '.join(extras)})"
+
+
+def is_people_query(question: str) -> bool:
+    q = (question or "").strip()
+    if not q:
+        return False
+    return any(m in q for m in _PEOPLE_QUERY_MARKERS)
+
+
+def reorder_org_context_for_people(org_context: str) -> str:
+    """
+    Move blocks that mention presidency / key org structure to the front
+    so the LLM does not anchor only on a short partial staff list ranked higher by RRF.
+    """
+    text = (org_context or "").strip()
+    if not text:
+        return text
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if len(blocks) <= 1:
+        return text
+
+    priority: List[str] = []
+    rest: List[str] = []
+    for b in blocks:
+        if any(m in b for m in _CONTEXT_PRIORITY_MARKERS):
+            priority.append(b)
+        else:
+            rest.append(b)
+
+    if not priority:
+        return text
+
+    ordered = priority + rest
+    return "\n\n".join(ordered)
+
+
+def extract_person_lines(org_context: str, *, max_lines: int = 40) -> List[str]:
+    """
+    Deterministic extraction of lines that look like name/title mentions.
+    Used as a mandatory checklist in the system prompt for people questions.
+    """
+    text = (org_context or "").strip()
+    if not text:
+        return []
+
+    found: List[str] = []
+    seen = set()
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if len(line) < 8 or len(line) > 240:
+            continue
+        # Must look role/title related
+        if not any(
+            k in line
+            for k in (
+                "دکتر",
+                "مهندس",
+                "ریاست",
+                "رئیس",
+                "معاون",
+                "مشاور",
+                "مسئول",
+                "کارشناس",
+                "مدیر",
+            )
+        ):
+            continue
+        # Prefer substantive lines (not pure headings with no name-like content)
+        norm = re.sub(r"\s+", " ", line)
+        key = norm.casefold() if hasattr(norm, "casefold") else norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(norm)
+        if len(found) >= max_lines:
+            break
+
+    # Also try regex pass for bullet-like rows missed above
+    if len(found) < 3:
+        for m in _PERSON_LINE_RE.finditer(text):
+            norm = re.sub(r"\s+", " ", m.group(0).strip())
+            key = norm.casefold() if hasattr(norm, "casefold") else norm.lower()
+            if key not in seen and len(norm) >= 8:
+                seen.add(key)
+                found.append(norm)
+            if len(found) >= max_lines:
+                break
+
+    return found
+
 
 class RAGState(TypedDict):
     question: str
@@ -57,7 +231,7 @@ class RAGState(TypedDict):
 BASE_RULES = (
     "قوانین مهم و غیرقابل نقض:\n"
     "- فقط و فقط بر اساس اطلاعات موجود در بخش «دانش سازمانی» و (در صورت وجود) "
-    "«محتوای فایل کاربر» و «تاریخچه گفتگو» پاسخ بده.\n"
+    "«محتوای فایل کاربر» و «تاریخچه گفتگو» و در صورت وجود «فهرست الزامی افراد استخراج‌شده» پاسخ بده.\n"
     "- هیچ ساعت کاری، نام فرد سازمانی، سمت، شماره تماس، آدرس یا واقعیت سازمانی را از دانش عمومی "
     "یا حدس خودت اضافه نکن.\n"
     "- اگر در دانش سازمانی چیزی مرتبط نیست، برای سؤالات سازمانی بگو اطلاعات در اسناد موجود نیست؛ "
@@ -67,10 +241,15 @@ BASE_RULES = (
     "  • هر دو نسخه را ذکر کن.\n"
     "  • تا حد امکان منبع هر نسخه را مشخص کن.\n"
     "  • بگو برای تأیید نهایی با مرکز تماس بگیرند.\n"
-    "- اگر سؤال دربارهٔ افراد یا سمت‌ها است و در context نام آمده:\n"
-    "  • همهٔ نام‌ها و سمت‌های مرتبط را ذکر کن؛ هیچ‌کدام را حذف نکن.\n"
-    "  • ریاست، معاونت و کارشناس اگر در context هستند همگی باید در پاسخ باشند.\n"
-    "- پاسخ را دوستانه، روان و حرفه‌ای بنویس؛ مختصر بودن به معنای حذف حقایق context نیست.\n"
+    "\n"
+    "قوانین ویژهٔ فهرست افراد / سمت‌ها / ساختار سازمانی (اجباری):\n"
+    "- اگر بخش «فهرست الزامی افراد استخراج‌شده از اسناد» وجود دارد، برای سؤال دربارهٔ افراد "
+    "باید همهٔ موارد آن فهرست در پاسخ بیاید (مگر کاملاً بی‌ربط به سؤال).\n"
+    "- اگر چند فهرست ناقص در دانش سازمانی هست، اتحاد بگیر؛ کوتاه‌ترین فهرست را به‌عنوان لیست کامل قبول نکن.\n"
+    "- ریاست مرکز در صورت وجود در دانش سازمانی یا فهرست الزامی حتماً ذکر شود.\n"
+    "- کوتاه‌نویسی به معنای حذف نام یا سمت مجاز نیست.\n"
+    "\n"
+    "- پاسخ را دوستانه، روان و حرفه‌ای بنویس.\n"
     "- عین جملات اسناد را کپی نکن؛ مضمون را با لحن پشتیبانی دانشگاه بازنویسی کن.\n"
 )
 
@@ -113,8 +292,8 @@ class SessionConversationMemory:
             self._store.pop(thread_id, None)
 
 
-# _conversation_memory = SessionConversationMemory()
 _conversation_memory = build_conversation_memory_from_settings()
+
 
 class RAGEngine:
     def __init__(self) -> None:
@@ -196,8 +375,24 @@ class RAGEngine:
     def _has_user_file(self, user_file_content: Optional[str]) -> bool:
         return bool(user_file_content and str(user_file_content).strip())
 
-    def _has_history(self, chat_history_text: str) -> bool:
-        return bool(chat_history_text and str(chat_history_text).strip())
+    def _prepare_org_context_for_question(
+        self, question: str, org_context: str
+    ) -> Tuple[str, List[str]]:
+        """
+        Returns (possibly reordered org_context, extracted person lines).
+        """
+        ctx = org_context or ""
+        people = is_people_query(question)
+        if people:
+            ctx = reorder_org_context_for_people(ctx)
+        person_lines = extract_person_lines(ctx) if people else []
+        if people:
+            logger.info(
+                "People-query context prep | person_lines=%s | has_presidency=%s",
+                len(person_lines),
+                any("ریاست" in x or "لاریجانی" in x for x in person_lines),
+            )
+        return ctx, person_lines
 
     async def _retrieve_for_query(
         self,
@@ -205,15 +400,16 @@ class RAGEngine:
         user_context: UserContext,
         session_id: str,
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """
-        Never raise to the HTTP layer: embedding/Qdrant outage → empty retrieval
-        so generate can fall back to dialogue mode or fixed empty policy.
-        """
-        logger.info("Hybrid retrieving org context | session=%s", session_id)
+        retrieval_query = expand_query_for_retrieval(question)
+        logger.info(
+            "Hybrid retrieving org context | session=%s | retrieval_query_len=%s",
+            session_id,
+            len(retrieval_query),
+        )
 
         def _run():
             return hybrid_search(
-                question,
+                retrieval_query,
                 user_context,
                 k=self.retrieval_k,
             )
@@ -236,11 +432,22 @@ class RAGEngine:
         chat_history_text: str,
         *,
         dialogue_only: bool = False,
+        person_lines: Optional[List[str]] = None,
     ) -> str:
         history_block = ""
         if chat_history_text and chat_history_text.strip():
             history_block = (
                 f"\n\nتاریخچه گفتگوی همین نشست:\n{chat_history_text.strip()}\n"
+            )
+
+        personnel_block = ""
+        if person_lines:
+            bullets = "\n".join(f"- {line}" for line in person_lines)
+            personnel_block = (
+                "\n\n### فهرست الزامی افراد استخراج‌شده از اسناد\n"
+                "(برای سؤال دربارهٔ افراد / سمت‌ها باید همهٔ موارد مرتبط زیر در پاسخ بیایند؛ "
+                "هیچ‌کدام را به‌خاطر کوتاه‌نویسی حذف نکن. اگر ریاست در فهرست است حتماً ذکر شود.)\n"
+                f"{bullets}\n"
             )
 
         if dialogue_only:
@@ -267,6 +474,7 @@ class RAGEngine:
                 "- اگر دانش سازمانی خالی است و فقط فایل کاربر موجود است، فقط بر اساس فایل پاسخ بده "
                 "و ادعا نکن که از اسناد رسمی مرکز آمده است.\n"
                 f"{history_block}"
+                f"{personnel_block}"
                 f"دانش سازمانی:\n{org_context}\n\n"
                 f"محتوای فایل کاربر:\n{user_file_content}"
             )
@@ -276,7 +484,20 @@ class RAGEngine:
             "فقط به دانش سازمانی رسمی (اسناد مرکز) دسترسی داری.\n\n"
             f"{BASE_RULES}\n"
             f"{history_block}"
+            f"{personnel_block}"
             f"دانش سازمانی:\n{org_context}"
+        )
+
+    def _human_message_for_question(self, question: str) -> str:
+        q = (question or "").strip()
+        if not is_people_query(q):
+            return q
+        return (
+            f"{q}\n\n"
+            "[دستور سیستم برای این نوبت] "
+            "اگر در دانش سازمانی یا فهرست الزامی افراد، ریاست مرکز یا نام‌هایی مثل "
+            "لاریجانی و سایر دکتر/مهندس‌ها آمده، همه را در پاسخ افراد بیاور. "
+            "به یک فهرست ناقص ابتدای متن اکتفا نکن."
         )
 
     async def _retrieve_node(self, state: RAGState) -> Dict[str, Any]:
@@ -293,15 +514,17 @@ class RAGEngine:
 
         user_file = state.get("user_file_content")
         question = state["question"]
-        org_context = state.get("org_context", "") or ""
+        org_context_raw = state.get("org_context", "") or ""
         sources = state.get("sources") or []
         history_text = state.get("chat_history_text", "") or ""
         thread_id = state.get("thread_id") or ""
 
+        org_context, person_lines = self._prepare_org_context_for_question(
+            question, org_context_raw
+        )
+
         has_org = self._has_org_evidence(org_context, sources)
         has_file = self._has_user_file(user_file)
-
-        # No org hits and no upload → dialogue (memory / chat-only); never invent org facts
         dialogue_only = not has_org and not has_file
 
         system_text = self._build_system_prompt(
@@ -309,11 +532,12 @@ class RAGEngine:
             user_file if has_file else None,
             history_text,
             dialogue_only=dialogue_only,
+            person_lines=person_lines if not dialogue_only else None,
         )
 
         messages = [
             SystemMessage(content=system_text),
-            HumanMessage(content=question),
+            HumanMessage(content=self._human_message_for_question(question)),
         ]
 
         try:
@@ -373,12 +597,16 @@ class RAGEngine:
         thread_id = self._build_thread_id(user_context, session_id)
         history_text = self.memory.format_for_prompt(thread_id)
 
-        org_context, sources = await self._retrieve_for_query(
+        org_context_raw, sources = await self._retrieve_for_query(
             question=question,
             user_context=user_context,
             session_id=session_id,
         )
         yield ("sources", sources)
+
+        org_context, person_lines = self._prepare_org_context_for_question(
+            question, org_context_raw
+        )
 
         has_org = self._has_org_evidence(org_context, sources)
         has_file = self._has_user_file(user_file_content)
@@ -389,10 +617,11 @@ class RAGEngine:
             user_file_content if has_file else None,
             history_text,
             dialogue_only=dialogue_only,
+            person_lines=person_lines if not dialogue_only else None,
         )
         messages = [
             SystemMessage(content=system_text),
-            HumanMessage(content=question),
+            HumanMessage(content=self._human_message_for_question(question)),
         ]
 
         full_parts: List[str] = []

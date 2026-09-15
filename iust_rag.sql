@@ -191,16 +191,20 @@ create table chat_sessions(
 
 # ------------------------------ chat_messages ------------------------------ #
 create table chat_messages(
-	id int not null auto_increment primary key,
-	content text,
+  id int not null auto_increment primary key,
+  content text,
   role enum('human', 'ai', 'system'),
   feedback enum('1', '0'),
   sources json,
   msg_id varchar(50) unique,
   session_id int, 
-  
+  edited_from_message_id int,
+
   index chat_message_session_index(session_id),
-	constraint chat_message_session_fk foreign key (session_id) references chat_sessions(id) on delete cascade on update cascade,
+  constraint chat_message_session_fk foreign key (session_id) references chat_sessions(id) on delete cascade on update cascade,
+
+  index chat_message_message_index(edited_from_message_id),
+  constraint chat_message_message_fk foreign key (edited_from_message_id) references chat_messages(id) on delete cascade on update cascade,
 	
 	created_at datetime null DEFAULT CURRENT_TIMESTAMP,
 	updated_at datetime null DEFAULT null,
